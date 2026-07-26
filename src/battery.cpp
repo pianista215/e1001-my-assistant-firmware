@@ -19,7 +19,16 @@ int readBatteryPercent() {
     digitalWrite(PIN_BATTERY_ENABLE, HIGH);
     delay(5);  // let the divider circuit settle
 
-    int mv = analogReadMilliVolts(PIN_BATTERY_ADC);
+    // A single ADC sample is noisy enough to swing the reported percentage
+    // by several points cycle to cycle; averaging a handful smooths that
+    // out without meaningfully lengthening the awake window.
+    constexpr int kSamples = 8;
+    long sumMv = 0;
+    for (int i = 0; i < kSamples; i++) {
+        sumMv += analogReadMilliVolts(PIN_BATTERY_ADC);
+        delay(2);
+    }
+    const int mv = static_cast<int>(sumMv / kSamples);
 
     digitalWrite(PIN_BATTERY_ENABLE, LOW);  // restore low-power state
 

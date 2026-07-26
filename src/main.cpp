@@ -3,6 +3,8 @@
 #include <esp_attr.h>
 #include <esp_sleep.h>
 
+#include "driver/rtc_io.h"
+
 #include <ctime>
 #include <sys/time.h>
 
@@ -22,10 +24,29 @@ RTC_DATA_ATTR static PersistentState g_state;
 
 namespace {
 
+const char* wakeupCauseString(esp_sleep_wakeup_cause_t cause) {
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_TIMER: return "TIMER (hourly schedule)";
+        case ESP_SLEEP_WAKEUP_EXT1: return "BUTTON (manual refresh)";
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "POWER-ON/RESET";
+        default: return "OTHER";
+    }
+}
+
+// Every sleep path (success, backoff, first-boot retry) goes through here,
+// so the wake button always works regardless of why the device is
+// sleeping -- e.g. forcing an immediate retry after fixing WiFi/API config
+// instead of waiting out a backoff.
 void goToSleep(uint32_t seconds) {
-    Serial1.printf("[MAIN] Sleeping for %lu s\n", static_cast<unsigned long>(seconds));
+    Serial1.printf("[MAIN] Sleeping for %lu s (or until the wake button is pressed)\n",
+                    static_cast<unsigned long>(seconds));
     Serial1.flush();
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
+    esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKE_BUTTON, ESP_EXT1_WAKEUP_ANY_LOW);
+    // Normal GPIO pull-up is off during deep sleep; the RTC (keep-alive)
+    // domain needs its own pull-up enabled instead.
+    rtc_gpio_pullup_en(static_cast<gpio_num_t>(PIN_WAKE_BUTTON));
+    rtc_gpio_pulldown_dis(static_cast<gpio_num_t>(PIN_WAKE_BUTTON));
     esp_deep_sleep_start();
 }
 
@@ -60,7 +81,7 @@ uint32_t backoffSeconds(uint8_t failures) {
 void setup() {
     Serial1.begin(SERIAL_BAUD, SERIAL_8N1, PIN_SERIAL_RX, PIN_SERIAL_TX);
     delay(100);
-    Serial1.printf("[MAIN] Wake cause: %d\n", esp_sleep_get_wakeup_cause());
+    Serial1.printf("[MAIN] Wake cause: %s\n", wakeupCauseString(esp_sleep_get_wakeup_cause()));
 
     // Must happen before any mktime()/localtime_r() call (including inside
     // rtc_pcf8563.cpp), since those interpret struct tm as local time in
@@ -76,13 +97,15 @@ void setup() {
         Serial1.println("[MAIN] PCF8563 time not trusted yet (VL flag set).");
     }
 
-    // Kick off WiFi association without blocking, then use the time spent
-    // negotiating to read the battery -- a handful of overlapped
-    // milliseconds, but free.
-    wifiBeginConnect(g_state.wifi);
+    // Read the battery BEFORE the radio does anything: the WiFi association
+    // burst draws enough current to sag the battery rail for a moment, and
+    // sampling during that sag reads a lower (wrong) voltage than the
+    // battery's real resting level -- worth the handful of milliseconds
+    // this costs versus overlapping it with WiFi connect.
     const int batteryPct = readBatteryPercent();
     Serial1.printf("[MAIN] Battery: %d%%\n", batteryPct);
 
+    wifiBeginConnect(g_state.wifi);
     const bool wifiOk =
         wifiWaitConnected(g_state.wifi, WIFI_FAST_RECONNECT_TIMEOUT_MS, WIFI_FULL_CONNECT_TIMEOUT_MS);
     if (!wifiOk) {

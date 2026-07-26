@@ -121,6 +121,23 @@ estado en RAM pueden hacer.
 el drift cada vez que hay red, en vez de implementar lógica de "cuánto ha
 pasado desde la última sincronización" para decidir cuándo re-sincronizar.
 
+## Decisión de diseño: botón físico de refresco manual
+
+`main.cpp` habilita `esp_sleep_enable_ext1_wakeup()` sobre `PIN_WAKE_BUTTON`
+(GPIO3, el botón "KEY0" que usa el propio ejemplo `LowPower_DeepSleep.ino`
+de Seeed) **además** del timer, dentro de `goToSleep()` — es decir, en
+*todos* los caminos de sueño (ciclo normal, backoff de errores, primer
+arranque), no solo el éxito. El ESP32 permite varias fuentes de wakeup
+activas a la vez; la que ocurra primero gana. Esto permite forzar un
+refresco inmediato (o reintentar tras arreglar WiFi/config) sin esperar al
+temporizador. El ciclo que se ejecuta al despertar es idéntico venga de
+donde venga — solo cambia el log de `wakeupCauseString()` al inicio.
+
+**Impacto en consumo**: mínimo. El propio dato de ~14µA que reporta Seeed
+para esta familia de placas viene de ese mismo ejemplo, que ya tiene el
+wakeup por botón activado — no es una cifra "solo timer" a la que esto le
+suma algo nuevo.
+
 ## Algoritmo de sueño (`time_scheduler.cpp`)
 
 Lógica pura sobre `struct tm`, sin dependencias de Arduino — testeable con
@@ -162,11 +179,25 @@ de certificado en vez de `WiFiClient` plano vía `HTTPClient`).
 | `config.h` | Constantes no-secretas: pines, timeouts, umbrales; valida que las secrets existan |
 | `sleep_state.h` | `struct PersistentState` (caché WiFi, contador de fallos, flag de hora sincronizada) |
 | `wifi_manager.{h,cpp}` | Reconexión rápida con caché BSSID/canal en RTC memory, fallback a scan completo |
-| `battery.{h,cpp}` | Lectura ADC GPIO1/GPIO21 → porcentaje 1-100 |
+| `battery.{h,cpp}` | Lectura ADC GPIO1/GPIO21 (promedio de 8 muestras) → porcentaje 1-100 |
 | `rtc_pcf8563.{h,cpp}` | Driver I2C del RTC hardware |
 | `display_client.{h,cpp}` | Cliente HTTP + validación estricta del formato EINK |
 | `eink_driver.{h,cpp}` | Driver UC8179 raw (init, LUTs, subida de bitplanes, refresh, sleep, pantalla de error) |
 | `time_scheduler.{h,cpp}` | Lógica pura de cálculo de próxima hora de despertar |
+
+## Decisión de diseño: la batería se lee antes de tocar el WiFi
+
+`main.cpp` llama a `readBatteryPercent()` **antes** de `wifiBeginConnect()`,
+no en paralelo con la negociación WiFi como en una versión anterior. La
+ráfaga de corriente que consume la radio al asociarse hunde momentáneamente
+el raíl de la batería (caída por resistencia interna), y muestrear el ADC
+justo en ese momento da una lectura de voltaje más baja de lo real —
+suficiente para que el porcentaje reportado salte varios puntos entre
+ciclos sin que la batería haya perdido esa energía de verdad. `battery.cpp`
+además promedia 8 muestras del ADC para suavizar el ruido de una sola
+lectura. El coste en tiempo despierto de leer secuencial en vez de en
+paralelo es de pocos milisegundos — irrelevante frente a la precisión que
+gana el reporte de batería.
 
 ## Manejo de errores
 
@@ -218,3 +249,7 @@ el dispositivo):
   mirar).
 - Consumo real en deep sleep (~14µA reportado por Seeed para esta familia
   de placas, no medido aquí).
+- Que el botón físico (GPIO3, "KEY0") despierte realmente el dispositivo en
+  esta unidad concreta y sea el botón que uno espera al mirar la carcasa —
+  la polaridad (`ANY_LOW`) y el pull-up del dominio RTC vienen del ejemplo
+  de Seeed, no verificados en este hardware todavía.

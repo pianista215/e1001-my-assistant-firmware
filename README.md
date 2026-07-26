@@ -101,12 +101,14 @@ pio device monitor -b 115200
 Deberías ver algo como:
 
 ```
-[MAIN] Wake cause: 0
+[MAIN] Wake cause: POWER-ON/RESET
 [MAIN] Battery: 87%
 [MAIN] WiFi connected.
 [MAIN] Cycle OK.
-[MAIN] Sleeping for 3600 s
+[MAIN] Sleeping for 3600 s (or until the wake button is pressed)
 ```
+
+El botón físico "KEY0" del dispositivo fuerza un ciclo inmediato sin esperar al temporizador (útil para forzar un refresco o reintentar tras arreglar algo) — en el siguiente arranque verás `Wake cause: BUTTON (manual refresh)` en vez de `TIMER (hourly schedule)`.
 
 Si no ves nada en absoluto (ni al reiniciar la placa), revisa la sección de troubleshooting.
 

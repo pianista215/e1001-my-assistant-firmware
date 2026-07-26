@@ -58,6 +58,13 @@ constexpr int PIN_SERIAL_RX = 44;
 constexpr int PIN_SERIAL_TX = 43;
 constexpr unsigned long SERIAL_BAUD = 115200;
 
+// Physical "KEY0" button (Seeed's own naming/pin choice for this board,
+// used identically in their LowPower_DeepSleep.ino example) -- lets a
+// manual press force an immediate cycle instead of waiting for the next
+// scheduled wake. Only GPIO0-21 can be an EXT1 deep-sleep wakeup source on
+// the ESP32-S3.
+constexpr int PIN_WAKE_BUTTON = 3;
+
 // ---- WiFi ----
 constexpr unsigned long WIFI_FAST_RECONNECT_TIMEOUT_MS = 2500;
 constexpr unsigned long WIFI_FULL_CONNECT_TIMEOUT_MS = 15000;
