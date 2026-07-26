@@ -140,8 +140,17 @@ void setup() {
     g_state.consecutiveFailures = 0;
     wifiDisconnect();
 
+#ifdef DEBUG_SLEEP_OVERRIDE_SEC
+    // Only touches the normal successful-cycle sleep, so a full real cycle
+    // (WiFi, fetch, draw) still runs every time -- just more often, to
+    // watch several deep-sleep/wake cycles without waiting an hour each.
+    // Never define this for real unattended use: see secrets.ini.example.
+    Serial1.println("[MAIN] DEBUG_SLEEP_OVERRIDE_SEC active -- not sleeping a full hour.");
+    goToSleep(DEBUG_SLEEP_OVERRIDE_SEC);
+#else
     const WakeDecision wake = computeNextWake(now);
     goToSleep(static_cast<uint32_t>(wake.sleepSeconds));
+#endif
 }
 
 void loop() {

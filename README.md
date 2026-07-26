@@ -76,6 +76,8 @@ Si quieres apuntar el firmware a este servidor local durante las primeras prueba
 
 ## 5. Compilar y flashear
 
+**Antes de conectar el cable, pon el interruptor físico de encendido (parte trasera) en ON.** El USB-C da alimentación igualmente, pero Seeed advierte explícitamente que no se puede flashear con el dispositivo apagado o en sleep. El LED verde se enciende ~30s al arrancar, indicando que está inicializando.
+
 Conecta el E1001 por USB-C y ejecuta:
 
 ```bash
@@ -108,6 +110,18 @@ Deberías ver algo como:
 
 Si no ves nada en absoluto (ni al reiniciar la placa), revisa la sección de troubleshooting.
 
+## Cómo confirmar que el deep sleep funciona (sin esperar 1 hora)
+
+No hace falta esperar el ciclo completo para saber que duerme de verdad y no está gastando batería:
+
+- **Silencio en el monitor tras "Sleeping for..."**: el chip para de ejecutar código por completo, así que no verás ningún log más hasta que despierte. Si en vez de silencio ves logs continuos o arranques repetidos, no está durmiendo.
+- **`Wake cause: 4` en el siguiente arranque**: `4` es `ESP_SLEEP_WAKEUP_TIMER`, confirma que ese arranque viene de un despertar por temporizador de deep sleep real, no de un cuelgue/reset (que aparecería como `Wake cause: 0`).
+- **Para ver varios ciclos completos en un par de minutos** en vez de esperar 1 hora cada vez, descomenta esta línea en tu `secrets.ini` (está de ejemplo, comentada, en `secrets.ini.example`):
+  ```ini
+  -D DEBUG_SLEEP_OVERRIDE_SEC=30
+  ```
+  Con esto, un ciclo completo y exitoso (WiFi + petición + pintado) duerme solo 30s en vez de hasta la próxima hora en punto — el resto del comportamiento no cambia. **Vuelve a comentarla y reflashea antes de dejarlo funcionando desatendido**, o nunca dormirá la hora real.
+
 ## Pruebas sin gastar refrescos del panel
 
 `time_scheduler` (la lógica de "cuándo despertar") es lógica pura, sin dependencias de Arduino, y tiene tests que corren en tu portátil sin ningún hardware:
@@ -121,6 +135,7 @@ pio test -e native
 ## Troubleshooting
 
 - **No aparece ningún `/dev/ttyUSB*` al conectar el cable**: prueba otro cable USB-C (algunos son solo de carga, sin líneas de datos) y comprueba `dmesg | tail` tras conectar — deberías ver algo mencionando `ch341`.
+- **El flasheo se queda colgado sin avanzar / el puerto no responde**: comprueba que el interruptor físico de encendido está en ON (no basta con tener el USB conectado) y que no está en sleep — si acaba de despertar, prueba a pulsar el botón verde de la parte superior antes de reintentar `pio run -t upload`.
 - **`pio run -t upload` falla con "Permission denied" en el puerto**: te falta el grupo `dialout` (paso 2) o no has vuelto a iniciar sesión tras añadirte.
 - **`pio device monitor` no muestra nada**: confirma que `platformio.ini` tiene `-D ARDUINO_USB_CDC_ON_BOOT=0` en `build_flags` (ya viene así) — sin ese flag, el firmware escribiría por el USB nativo del ESP32-S3, que en esta placa no está conectado a ningún cable.
 - **El panel no pinta nada / se queda colgado**: mira los logs por `pio device monitor` — el driver del e-ink tiene un timeout de 15s en la espera del pin BUSY, así que un fallo de panel se ve como un log de error, no como un cuelgue silencioso.

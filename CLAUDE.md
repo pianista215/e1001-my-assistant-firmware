@@ -38,6 +38,21 @@ levantando el servidor real (`go run ./cmd/server` en `../my-assistant`) y
 haciendo un `curl` real durante el desarrollo de este firmware — no es solo
 lectura de código.
 
+**La respuesta va sin `Content-Length`, con `Transfer-Encoding: chunked`**
+(confirmado con `curl -D -` contra el servidor real): el `net/http` de Go
+deja de poder precomputar el `Content-Length` en cuanto el handler escribe
+más del buffer interno pequeño que usa para decidirlo, y un cuerpo de ~96KB
+siempre lo supera. Esto se descubrió con el primer flasheo real (fallaba
+con `TOO_LARGE` porque `HTTPClient::getSize()` devuelve `-1` sin
+`Content-Length`). `display_client.cpp` por eso no usa `getSize()` en
+absoluto: reserva un buffer de tamaño fijo (`HTTP_MAX_RESPONSE_BYTES`) en
+PSRAM y usa `HTTPClient::writeToStream()` con un `Stream` propio
+(`MemoryStream`) que vuelca ahí — `writeToStream()` exige un `Stream*`, no
+un `Print*`, aunque solo escriba en él (de ahí los métodos de lectura vacíos
+de `MemoryStream`). Decodifica chunked transparentemente, así que funciona
+igual si el backend cambiara algún día
+a `Content-Length` fijo.
+
 `display_client.cpp` valida esto byte a byte antes de tocar el display
 (magic, versión, bpp, dimensiones exactas, longitud de payload). Rechaza
 cualquier ancho/alto distinto de 800×480: el panel físico no puede mostrar
