@@ -105,8 +105,8 @@ Enfoque (`main.cpp` + `rtc_pcf8563.cpp`):
    red). Si el flag VL (voltage-low) está activo, la hora no es fiable y se
    ignora.
 2. Tras conectar WiFi: intentar SNTP (`configTzTime` + `getLocalTime`,
-   timeout corto). Si funciona, es autoritativo — se re-escribe al PCF8563
-   para que el drift no se acumule ciclo a ciclo.
+   timeout `SNTP_SYNC_TIMEOUT_MS`). Si funciona, es autoritativo — se
+   re-escribe al PCF8563 para que el drift no se acumule ciclo a ciclo.
 3. Si SNTP falla pero el PCF8563 dio hora válida este ciclo, o si ya se
    sincronizó alguna vez desde el último power-on (el reloj del sistema del
    ESP32 sigue avanzando solo entre ciclos de deep sleep), se usa
@@ -124,6 +124,19 @@ estado en RAM pueden hacer.
 **Por qué no solo el PCF8563**: es más simple confiar en que SNTP corrige
 el drift cada vez que hay red, en vez de implementar lógica de "cuánto ha
 pasado desde la última sincronización" para decidir cuándo re-sincronizar.
+
+**Hallazgo real con el dispositivo**: `SNTP_SYNC_TIMEOUT_MS` empezó en
+3000ms y resultó demasiado ajustado en la práctica — en una red con
+internet real confirmado, la primera sincronización SNTP de un ciclo
+(resolución DNS de `pool.ntp.org` + ida y vuelta del paquete NTP) puede
+tardar más de eso, así que el dispositivo caía en la rama de "sin hora
+fiable todavía" (`FIRST_BOOT_RETRY_SLEEP_SEC`, 5 min de espera) en ciclos
+donde SNTP habría funcionado con un poco más de margen — confirmado
+forzando un segundo ciclo con el botón, que sí sincronizó. Subido a
+8000ms: no penaliza el caso normal (una sync exitosa no tarda más por
+tener más presupuesto disponible) y evita gastar un ciclo entero de
+reintento (con su propia reconexión WiFi) por una sync que solo necesitaba
+unos segundos más.
 
 ## Decisión de diseño: botón físico de refresco manual
 

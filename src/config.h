@@ -62,7 +62,16 @@ constexpr unsigned long HTTP_TIMEOUT_MS = 8000;
 constexpr size_t HTTP_MAX_RESPONSE_BYTES = 200000;  // defensive cap before allocating
 
 // ---- SNTP ----
-constexpr unsigned long SNTP_SYNC_TIMEOUT_MS = 3000;
+// 3000ms was too tight in practice: confirmed on real hardware with a
+// genuinely internet-connected network -- the first sync of a boot can
+// take longer than that (DNS resolution + round trip), which was causing
+// spurious "no trustworthy time source yet" retries even though SNTP
+// would have succeeded given a bit more time. A longer timeout costs
+// nothing on the common case (a successful sync doesn't take longer just
+// because more time is budgeted for it) and avoids burning a full
+// FIRST_BOOT_RETRY_SLEEP_SEC cycle (and the WiFi reconnect that comes
+// with it) on what would otherwise have been a successful sync.
+constexpr unsigned long SNTP_SYNC_TIMEOUT_MS = 8000;
 constexpr const char* SNTP_SERVER_1 = "pool.ntp.org";
 constexpr const char* SNTP_SERVER_2 = "time.google.com";
 
