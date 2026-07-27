@@ -1,24 +1,12 @@
 #pragma once
 
-// Non-secret compile-time constants: pins, timeouts, thresholds. Per-device
-// secrets (WIFI_SSID, WIFI_PASSWORD, API_BASE_URL, API_AUTH_TOKEN, TZ_STRING)
-// are injected as -D build flags from secrets.ini (see secrets.ini.example)
-// and are already visible as macros everywhere without an include -- these
-// #ifndef guards just fail the build early with a clear message if that
-// file was never copied.
+// Non-secret compile-time constants: pins, timeouts, thresholds. WiFi
+// credentials and API endpoint/token/fingerprint are no longer compile-time
+// secrets -- they're entered through the first-boot SoftAP setup portal
+// (see device_config.h/setup_portal.h) and persisted in NVS. Only
+// TZ_STRING (and the optional DEBUG_SLEEP_OVERRIDE_SEC dev flag) remain as
+// -D build flags from secrets.ini (see secrets.ini.example).
 
-#ifndef WIFI_SSID
-#error "WIFI_SSID not defined -- did you copy secrets.ini.example to secrets.ini?"
-#endif
-#ifndef WIFI_PASSWORD
-#error "WIFI_PASSWORD not defined -- did you copy secrets.ini.example to secrets.ini?"
-#endif
-#ifndef API_BASE_URL
-#error "API_BASE_URL not defined -- did you copy secrets.ini.example to secrets.ini?"
-#endif
-#ifndef API_AUTH_TOKEN
-#error "API_AUTH_TOKEN not defined -- did you copy secrets.ini.example to secrets.ini?"
-#endif
 #ifndef TZ_STRING
 #error "TZ_STRING not defined -- did you copy secrets.ini.example to secrets.ini?"
 #endif
@@ -90,3 +78,32 @@ constexpr uint32_t FIRST_BOOT_RETRY_SLEEP_SEC = 5 * 60;
 constexpr uint8_t ERROR_SCREEN_AFTER_N_FAILURES = 3;
 constexpr uint32_t BACKOFF_BASE_SEC = 5 * 60;
 constexpr uint32_t BACKOFF_MAX_SEC = 60 * 60;
+
+// ---- Provisioning / reset-to-setup gesture ----
+// Holding the wake button this long on an EXT1 wake (while already
+// configured) clears the saved config and re-enters the setup portal.
+// Below this, it's treated as a normal manual-refresh press.
+constexpr unsigned long RESET_HOLD_MS = 10000;
+constexpr unsigned long RESET_HOLD_POLL_MS = 100;
+// If nobody finishes the setup form, stop burning battery on AP/DNS/HTTP
+// and go back to deep sleep for a while -- device_config::isConfigured()
+// is still false, so the next wake re-enters the portal automatically.
+constexpr uint32_t PORTAL_INACTIVITY_TIMEOUT_MS = 10UL * 60 * 1000;
+constexpr uint32_t PORTAL_RETRY_SLEEP_SEC = 5 * 60;
+// Timeout for the STA connection attempted live during setup validation
+// (no cached BSSID/channel yet, so always the "full" timeout).
+constexpr unsigned long PORTAL_VALIDATE_WIFI_TIMEOUT_MS = 15000;
+
+// ---- Provisioning SoftAP ----
+constexpr const char* AP_SSID_PREFIX = "E1001-Setup-";
+
+// ---- Provisioning QR code (WiFi-join payload) ----
+// QR version 5 (37x37 modules) comfortably covers a
+// "WIFI:T:WPA;S:<ssid>;P:<password>;;" payload (SSID up to 32 chars +
+// our own fixed-length generated password) at ECC level LOW -- see
+// qrcodegen's capacity table if the payload format ever grows.
+constexpr uint8_t QR_VERSION = 5;
+constexpr uint8_t QR_QUIET_ZONE_MODULES = 4;
+
+// ---- NVS (runtime-persisted device config) ----
+constexpr const char* NVS_NAMESPACE = "e1001cfg";

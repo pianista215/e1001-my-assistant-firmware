@@ -33,4 +33,13 @@ void sleep();
 // this after several consecutive failures, not on the first blip.
 void drawErrorScreen(const char* code, uint8_t consecutiveFailures);
 
+// Renders the first-boot / reset provisioning screen: a scannable
+// "WIFI:T:WPA;S:...;P:...;;" QR code (see setup_portal.h) that lets a
+// phone camera join the setup hotspot directly, plus the AP SSID/password
+// and a fallback URL as plain text for phones that don't auto-join from a
+// QR. Called once per portal session (see setup_portal.cpp) -- not meant
+// to be redrawn on every retry.
+void drawProvisioningScreen(const char* apSsid, const char* apPassword,
+                             const char* qrPayload, const char* fallbackUrl);
+
 }  // namespace eink

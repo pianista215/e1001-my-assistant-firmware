@@ -26,14 +26,13 @@ void refreshCache(WifiFastConnect& cache) {
 
 }  // namespace
 
-void wifiBeginConnect(const WifiFastConnect& cache) {
-    WiFi.mode(WIFI_STA);
+void wifiBeginConnect(const char* ssid, const char* password, const WifiFastConnect& cache) {
     WiFi.persistent(false);  // avoid wearing out flash NVS every cycle
 
     if (cache.valid) {
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD, cache.channel, cache.bssid, true);
+        WiFi.begin(ssid, password, cache.channel, cache.bssid, true);
     } else {
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        WiFi.begin(ssid, password);
     }
 }
 
@@ -50,9 +49,11 @@ bool wifiWaitConnected(WifiFastConnect& cache,
 
     if (usedCache) {
         // Cached BSSID/channel is stale (router rebooted, roamed, etc.) --
-        // fall back to a full scan+connect instead of giving up.
+        // fall back to a full scan+connect instead of giving up. The SSID
+        // and password used here are whatever was last passed to
+        // wifiBeginConnect(), which WiFi.begin() already remembers.
         WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        WiFi.begin();
         if (waitForConnection(fullTimeoutMs)) {
             refreshCache(cache);
             return true;
