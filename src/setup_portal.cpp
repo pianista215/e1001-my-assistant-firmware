@@ -4,6 +4,8 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cctype>
 
@@ -21,6 +23,47 @@ DNSServer dnsServer;
 unsigned long g_lastActivity = 0;
 
 void touchActivity() { g_lastActivity = millis(); }
+
+constexpr uint32_t VALIDATION_TASK_STACK_BYTES = 16384;
+constexpr UBaseType_t VALIDATION_TASK_PRIORITY = 1;  // same as loopTask
+
+// Live-validation progress, polled by the phone during handleSave() so a
+// single dropped request (e.g. the SoftAP hopping channels when the STA
+// associates elsewhere -- see CLAUDE.md) never leaves the page stuck
+// waiting on one long-lived response. Written by validationTask() (a
+// background FreeRTOS task), read by the HTTP handlers running on the
+// main loop task -- protected by g_validationMux since it's genuinely
+// cross-task shared state.
+enum class ValidationStage : uint8_t {
+    Idle,
+    ConnectingWifi,
+    TestingEndpoint,
+    Success,
+    Failed,
+};
+
+struct ValidationState {
+    ValidationStage stage = ValidationStage::Idle;
+    String message;          // human-readable, also used to prefill the error banner
+    DeviceConfig candidate;  // last attempt, so a failed retry doesn't retype everything
+};
+
+ValidationState g_validationState;
+portMUX_TYPE g_validationMux = portMUX_INITIALIZER_UNLOCKED;
+
+ValidationState snapshotValidationState() {
+    portENTER_CRITICAL(&g_validationMux);
+    ValidationState copy = g_validationState;
+    portEXIT_CRITICAL(&g_validationMux);
+    return copy;
+}
+
+void setValidationProgress(ValidationStage stage, const String& message) {
+    portENTER_CRITICAL(&g_validationMux);
+    g_validationState.stage = stage;
+    g_validationState.message = message;
+    portEXIT_CRITICAL(&g_validationMux);
+}
 
 // Deterministic per-device suffix so the AP SSID/password (and therefore
 // the QR payload) don't change between provisioning retries.
@@ -121,6 +164,89 @@ String explainFetchError(const DisplayFetchResult& fetch) {
     return "Error desconocido.";
 }
 
+// Runs on a background FreeRTOS task so the WebServer/DNSServer loop in
+// setup_portal::run() never blocks on WiFi/HTTPS timeouts (up to ~23s
+// combined) -- see CLAUDE.md for why that mattered on real hardware.
+// Invariant: this function must NEVER touch `server` (WebServer isn't
+// thread-safe) -- only setValidationProgress()/the mutex-protected state.
+void validationTask(void* param) {
+    DeviceConfig* candidate = static_cast<DeviceConfig*>(param);
+
+    WifiFastConnect scratch;
+    wifiBeginConnect(candidate->wifiSsid.c_str(), candidate->wifiPassword.c_str(), scratch);
+    const bool wifiOk =
+        wifiWaitConnected(scratch, PORTAL_VALIDATE_WIFI_TIMEOUT_MS, PORTAL_VALIDATE_WIFI_TIMEOUT_MS);
+    if (!wifiOk) {
+        WiFi.disconnect(false);  // drop the STA attempt only, keep the AP alive
+        setValidationProgress(ValidationStage::Failed,
+                               "No se pudo conectar a esa wifi (SSID/contraseña incorrectos o "
+                               "fuera de alcance).");
+        delete candidate;
+        vTaskDelete(nullptr);
+        return;  // unreachable; vTaskDelete(nullptr) never returns
+    }
+
+    setValidationProgress(ValidationStage::TestingEndpoint, "Conectado a la wifi. Probando el servidor...");
+
+    // Same fetchDisplayBuffer() the normal hourly cycle uses -- one HTTP
+    // client code path, exercised for real here.
+    const DisplayEndpointConfig ep{candidate->apiBaseUrl, candidate->apiAuthToken,
+                                    candidate->tlsFingerprint};
+    DisplayFetchResult fetch = fetchDisplayBuffer(ep, /*batteryPercent=*/50);
+    const bool fetchOk = fetch.ok();
+    const String errorMessage = fetchOk ? String() : explainFetchError(fetch);
+    fetch.free();
+    WiFi.disconnect(false);
+
+    if (!fetchOk) {
+        setValidationProgress(ValidationStage::Failed, errorMessage);
+        delete candidate;
+        vTaskDelete(nullptr);
+        return;  // unreachable; vTaskDelete(nullptr) never returns
+    }
+
+    setValidationProgress(ValidationStage::Success, "Configuración verificada. Guardando y reiniciando...");
+    device_config::save(*candidate);
+    delete candidate;
+
+    // The client learns about success on its next poll (up to ~1s away),
+    // not from a direct HTTP response -- keep this delay so the SoftAP
+    // doesn't disappear before that poll can land, same reasoning the old
+    // synchronous handler had for delaying before tearing down the AP.
+    delay(1500);
+    WiFi.softAPdisconnect(true);
+    wifiDisconnect();
+    ESP.restart();
+    while (true) delay(1000);  // unreachable
+}
+
+// Atomic check-and-set: refuses to start a second validation if one's
+// already in flight (e.g. a double-tap on "Guardar"), which would
+// otherwise race two tasks over the same WiFi radio.
+void tryStartValidation(const DeviceConfig& candidate) {
+    portENTER_CRITICAL(&g_validationMux);
+    const bool alreadyRunning = g_validationState.stage == ValidationStage::ConnectingWifi ||
+                                 g_validationState.stage == ValidationStage::TestingEndpoint;
+    if (!alreadyRunning) {
+        g_validationState.stage = ValidationStage::ConnectingWifi;
+        g_validationState.message = "Conectando a la red wifi...";
+        g_validationState.candidate = candidate;
+    }
+    portEXIT_CRITICAL(&g_validationMux);
+    if (alreadyRunning) return;
+
+    DeviceConfig* taskArg = new DeviceConfig(candidate);
+    const BaseType_t created = xTaskCreate(validationTask, "portal_validate",
+                                            VALIDATION_TASK_STACK_BYTES, taskArg,
+                                            VALIDATION_TASK_PRIORITY, nullptr);
+    if (created != pdPASS) {
+        delete taskArg;
+        setValidationProgress(ValidationStage::Failed,
+                               "No se pudo iniciar la validación (memoria insuficiente). Vuelve a "
+                               "intentarlo.");
+    }
+}
+
 String htmlEscape(const String& in) {
     String out;
     out.reserve(in.length());
@@ -193,8 +319,116 @@ String renderSavedPage() {
            "</body></html>";
 }
 
+const char* stageToJsonToken(ValidationStage stage) {
+    switch (stage) {
+        case ValidationStage::Idle: return "idle";
+        case ValidationStage::ConnectingWifi: return "connecting_wifi";
+        case ValidationStage::TestingEndpoint: return "testing_endpoint";
+        case ValidationStage::Success: return "success";
+        case ValidationStage::Failed: return "failed";
+    }
+    return "idle";
+}
+
+// Defensive: messages are mostly generated in-house, but
+// explainFetchError() folds in fetch.actualFingerprintHex, which
+// ultimately comes from whatever certificate the remote server presented
+// -- not something to trust blindly inside a JSON string literal.
+String jsonEscape(const String& in) {
+    String out;
+    out.reserve(in.length());
+    for (size_t i = 0; i < in.length(); i++) {
+        const char c = in[i];
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Polls GET /validate-status every ~1s. Deliberately does NOT treat a
+// failed fetch() as an error -- the SoftAP briefly hopping channels (see
+// CLAUDE.md) can drop one poll, and the fix is to just retry, not to give
+// up. Each poll carries its own AbortController timeout: fetch() has no
+// timeout by default, and an unresolved (not immediately failed) request
+// would otherwise reproduce the exact "stuck with no reaction" symptom
+// this whole mechanism exists to avoid.
+String renderValidatingPage() {
+    return "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+           "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+           "<title>Verificando...</title><style>"
+           "body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;}"
+           ".msg{padding:12px;border-radius:6px;margin-top:16px;}"
+           ".err{background:#fdecea;color:#611a15;}"
+           ".ok{background:#e6f4ea;color:#1e4620;}"
+           ".hint{color:#666;font-size:13px;margin-top:12px;}"
+           "</style></head><body><h2>Verificando la configuración</h2>"
+           "<div id=\"status\" class=\"msg\">Conectando a la red wifi...</div>"
+           "<div id=\"slow\" class=\"hint\" style=\"display:none\">Esto está tardando más de lo "
+           "normal -- comprueba que tu móvil sigue conectado al hotspot del dispositivo.</div>"
+           "<p id=\"retryLink\" style=\"display:none\"><a href=\"/\">Volver e intentar de nuevo</a></p>"
+           "<script>"
+           "var startedAt = Date.now();"
+           "var slowWarned = false;"
+           "function poll() {"
+           "  var controller = new AbortController();"
+           "  var timeoutId = setTimeout(function() { controller.abort(); }, 4000);"
+           "  fetch('/validate-status', {cache: 'no-store', signal: controller.signal})"
+           "    .then(function(r) { return r.json(); })"
+           "    .then(function(data) {"
+           "      clearTimeout(timeoutId);"
+           "      var el = document.getElementById('status');"
+           "      el.textContent = data.message || '...';"
+           "      if (data.stage === 'failed') {"
+           "        el.className = 'msg err';"
+           "        document.getElementById('retryLink').style.display = 'block';"
+           "        return;"
+           "      }"
+           "      if (data.stage === 'success') {"
+           "        el.className = 'msg ok';"
+           "        return;"
+           "      }"
+           "      scheduleNext();"
+           "    })"
+           "    .catch(function() { clearTimeout(timeoutId); scheduleNext(); });"
+           "}"
+           "function scheduleNext() {"
+           "  if (!slowWarned && Date.now() - startedAt > 60000) {"
+           "    slowWarned = true;"
+           "    document.getElementById('slow').style.display = 'block';"
+           "  }"
+           "  setTimeout(poll, 1000);"
+           "}"
+           "poll();"
+           "</script></body></html>";
+}
+
 void handleRoot() {
     touchActivity();
+    const ValidationState snap = snapshotValidationState();
+    if (snap.stage == ValidationStage::Failed) {
+        server.send(200, "text/html", renderFormPage(snap.candidate, snap.message, true));
+        return;
+    }
+    if (snap.stage == ValidationStage::ConnectingWifi || snap.stage == ValidationStage::TestingEndpoint) {
+        // A validation is already in flight (user navigated back to / or
+        // reopened the page) -- keep them on the progress view instead of
+        // a blank form that would invite a redundant resubmit.
+        server.send(200, "text/html", renderValidatingPage());
+        return;
+    }
     server.send(200, "text/html", renderFormPage(DeviceConfig{}, "", false));
 }
 
@@ -242,46 +476,35 @@ void handleSave() {
         return;
     }
 
-    if (!saveAnyway) {
-        // The SoftAP is already up in WIFI_AP_STA -- this only drives the
-        // STA side, the phone connected to our AP stays connected.
-        WifiFastConnect scratch;
-        wifiBeginConnect(candidate.wifiSsid.c_str(), candidate.wifiPassword.c_str(), scratch);
-        const bool wifiOk =
-            wifiWaitConnected(scratch, PORTAL_VALIDATE_WIFI_TIMEOUT_MS, PORTAL_VALIDATE_WIFI_TIMEOUT_MS);
-        if (!wifiOk) {
-            WiFi.disconnect(false);  // drop the STA attempt only, keep the AP alive
-            server.send(200, "text/html",
-                         renderFormPage(candidate,
-                                         "No se pudo conectar a esa wifi (SSID/contraseña "
-                                         "incorrectos o fuera de alcance).",
-                                         true));
-            return;
-        }
-
-        // Same fetchDisplayBuffer() the normal hourly cycle uses -- one
-        // HTTP client code path, exercised for real here.
-        const DisplayEndpointConfig ep{candidate.apiBaseUrl, candidate.apiAuthToken,
-                                        candidate.tlsFingerprint};
-        DisplayFetchResult fetch = fetchDisplayBuffer(ep, /*batteryPercent=*/50);
-        const String errorMessage = fetch.ok() ? String() : explainFetchError(fetch);
-        fetch.free();
-        WiFi.disconnect(false);
-
-        if (!errorMessage.isEmpty()) {
-            server.send(200, "text/html", renderFormPage(candidate, errorMessage, true));
-            return;
-        }
+    if (saveAnyway) {
+        // No network to test -- nothing to run in the background, save
+        // and restart synchronously exactly like before.
+        device_config::save(candidate);
+        server.send(200, "text/html", renderSavedPage());
+        server.client().flush();
+        delay(1500);  // give the response time to actually reach the phone
+        WiFi.softAPdisconnect(true);
+        wifiDisconnect();
+        ESP.restart();
+        while (true) delay(1000);  // unreachable
     }
 
-    device_config::save(candidate);
-    server.send(200, "text/html", renderSavedPage());
-    server.client().flush();
-    delay(1500);  // give the response time to actually reach the phone
-    WiFi.softAPdisconnect(true);
-    wifiDisconnect();
-    ESP.restart();
-    while (true) delay(1000);  // unreachable
+    // Validation itself (WiFi connect + HTTPS test, up to ~23s combined)
+    // runs on a background task -- see validationTask() -- so this
+    // handler returns immediately and the phone gets progress via polling
+    // instead of one long-lived request that a SoftAP channel hop could
+    // drop with no way to recover (see CLAUDE.md for how that showed up
+    // on real hardware).
+    tryStartValidation(candidate);
+    server.send(200, "text/html", renderValidatingPage());
+}
+
+void handleValidateStatus() {
+    touchActivity();
+    const ValidationState snap = snapshotValidationState();
+    const String json = String("{\"stage\":\"") + stageToJsonToken(snap.stage) + "\",\"message\":\"" +
+                         jsonEscape(snap.message) + "\"}";
+    server.send(200, "application/json", json);
 }
 
 void redirectToPortalRoot() {
@@ -323,6 +546,7 @@ namespace setup_portal {
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
+    server.on("/validate-status", HTTP_GET, handleValidateStatus);
     registerCaptivePortalRoutes();
     server.begin();
 

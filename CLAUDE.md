@@ -230,6 +230,44 @@ durante esta validación nunca se llama a `wifiDisconnect()` (que hace
 `WiFi.mode(WIFI_OFF)` y tiraría también el AP) — se usa
 `WiFi.disconnect(false)` para soltar solo el lado STA.
 
+**Hallazgo real con el dispositivo (validación bloqueaba el portal)**: en
+`WIFI_AP_STA`, el ESP32 solo puede tener el AP y la STA en el mismo canal
+radio — en cuanto la STA se asocia a la wifi candidata, si está en un
+canal distinto al que el AP usaba con el móvil, el chip fuerza al AP a
+saltar a ese canal, y el móvil sufre una microdesconexión/reasociación en
+ese instante. La primera versión de `handleSave()` era totalmente
+síncrona (hasta ~23s bloqueando el único hilo de `WebServer`: 15s de
+`wifiWaitConnected` + 8s de `fetchDisplayBuffer`), así que si ese salto de
+canal coincidía con la única petición `POST /save` en curso, esa petición
+se perdía sin más reintento posible y la página se quedaba con el
+spinner sin reaccionar — confirmado por el usuario en pruebas reales
+("se ha quedado pillado el portal sin reaccionar a los botones"; el
+dispositivo en sí no se colgaba, solo esa respuesta HTTP concreta nunca
+llegaba). Arreglado moviendo la validación a una tarea FreeRTOS en segundo
+plano (`validationTask()`, `xTaskCreate` con 16384 bytes de stack —
+el doble del stack de 8192 bytes con el que `loopTask` ya ejecuta este
+mismo `fetchDisplayBuffer()` con su handshake TLS sin problema — y
+prioridad 1, igual que `loopTask`), dejando `run()` libre para seguir
+atendiendo `dnsServer.processNextRequest()`/`server.handleClient()` sin
+bloqueos largos. Un estado compartido (`ValidationStage` +
+`ValidationState`, protegido con un spinlock `portMUX_TYPE`, ya que se
+lee/escribe desde la tarea de fondo y desde los handlers HTTP del loop
+principal) expone `Idle → ConnectingWifi → TestingEndpoint →
+Success`/`Failed`; `handleSave()` ahora responde al instante con una
+página que hace polling a `GET /validate-status` (JSON) cada ~1s vía
+`fetch()` con su propio `AbortController` de 4s (sin esto, un poll que se
+quede a medias por el mismo salto de canal reproduciría el mismo síntoma
+de "colgado", ahora en el JS en vez de en el servidor) — si un poll falla,
+simplemente se reintenta en el siguiente ciclo en vez de mostrarse como
+error, que es la mejora de resiliencia real frente al diseño síncrono
+anterior. Invariante importante: `validationTask()` nunca toca el objeto
+`WebServer` (no es thread-safe), solo el estado protegido por el mutex.
+`tryStartValidation()` hace un check-and-set atómico para que un
+doble-tap en "Guardar" no lance dos tareas compitiendo por el WiFi a la
+vez. `handleRoot()` usa el mismo estado para prerellenar el formulario
+tras un fallo, o para devolver la página de progreso si el usuario
+navega a `/` con una validación ya en curso.
+
 **Por qué `wifiBeginConnect()` ya no fija `WiFi.mode()` internamente**:
 antes ponía `WIFI_STA` incondicionalmente; si el portal la reutilizara tal
 cual, cada intento de validación tiraría el SoftAP al que el móvil del
@@ -401,10 +439,13 @@ el dispositivo):
   (contraste, tamaño de módulo) — `QR_VERSION`/el tamaño de caja en
   `eink_driver.cpp` están dimensionados con margen sobre el payload
   esperado, pero no se ha escaneado un QR real desde este panel.
-- Convivencia real de `WIFI_AP_STA` durante la validación en vivo del
-  portal: hay reportes de que el core Arduino-ESP32 puede forzar al AP a
-  saltar de canal al asociar la STA en un canal distinto, lo que podría
-  desconectar brevemente al móvil del hotspot mientras se valida.
+- Que el polling de `/validate-status` (con el `AbortController` de 4s y
+  reintento cada ~1s) efectivamente absorba el salto de canal del AP en
+  `WIFI_AP_STA` sin que el usuario tenga que recargar manualmente la
+  página — el salto de canal en sí ya está confirmado que ocurre en
+  hardware real (ver "Hallazgo real" arriba); lo que falta por confirmar
+  es que la mitigación async lo haga imperceptible en la práctica y no
+  solo en el diseño.
 - Consumo real de batería con el SoftAP + `DNSServer` + `WebServer`
   activos durante varios minutos, para calibrar
   `PORTAL_INACTIVITY_TIMEOUT_MS`/`PORTAL_RETRY_SLEEP_SEC` con datos reales
