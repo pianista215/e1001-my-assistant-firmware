@@ -7,8 +7,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include <cctype>
-
 #include "config.h"
 #include "device_config.h"
 #include "display_client.h"
@@ -37,15 +35,23 @@ constexpr UBaseType_t VALIDATION_TASK_PRIORITY = 1;  // same as loopTask
 enum class ValidationStage : uint8_t {
     Idle,
     ConnectingWifi,
+    FetchingCertificate,             // https only: TOFU TLS probe in flight
+    AwaitingFingerprintConfirmation,  // https only: waiting on a human decision
     TestingEndpoint,
     Success,
     Failed,
 };
 
+// Set by handleValidateConfirm() (main loop task), read by validationTask()
+// (background task) while it's parked waiting on AwaitingFingerprintConfirmation.
+enum class FingerprintDecision : uint8_t { Pending, Confirmed, Rejected };
+
 struct ValidationState {
     ValidationStage stage = ValidationStage::Idle;
     String message;          // human-readable, also used to prefill the error banner
     DeviceConfig candidate;  // last attempt, so a failed retry doesn't retype everything
+    String pendingFingerprint;                              // awaiting confirmation
+    FingerprintDecision decision = FingerprintDecision::Pending;
 };
 
 ValidationState g_validationState;
@@ -62,6 +68,17 @@ void setValidationProgress(ValidationStage stage, const String& message) {
     portENTER_CRITICAL(&g_validationMux);
     g_validationState.stage = stage;
     g_validationState.message = message;
+    portEXIT_CRITICAL(&g_validationMux);
+}
+
+// Atomic check-and-set: only applies the decision if we're still actually
+// waiting on one (guards against a stale/duplicate confirm arriving after
+// the attempt already timed out, was rejected, or a new attempt started).
+void trySetFingerprintDecision(FingerprintDecision decision) {
+    portENTER_CRITICAL(&g_validationMux);
+    if (g_validationState.stage == ValidationStage::AwaitingFingerprintConfirmation) {
+        g_validationState.decision = decision;
+    }
     portEXIT_CRITICAL(&g_validationMux);
 }
 
@@ -95,29 +112,6 @@ String escapeQrField(const String& in) {
 
 String buildWifiQrPayload(const String& ssid, const String& password) {
     return "WIFI:T:WPA;S:" + escapeQrField(ssid) + ";P:" + escapeQrField(password) + ";;";
-}
-
-// Accepts whatever punctuation/case the user pasted from the backend's
-// /api/v1/tls-cert page (colon-separated, upper or lower case) and
-// normalizes to bare uppercase hex, which is what gets stored and what
-// WiFiClientSecure::verify() expects.
-String normalizeFingerprint(const String& raw) {
-    String out;
-    out.reserve(64);
-    for (size_t i = 0; i < raw.length(); i++) {
-        const char c = raw[i];
-        if (c == ':' || isspace(static_cast<unsigned char>(c))) continue;
-        out += static_cast<char>(toupper(static_cast<unsigned char>(c)));
-    }
-    return out;
-}
-
-bool isValidFingerprint(const String& normalized) {
-    if (normalized.length() != 64) return false;
-    for (size_t i = 0; i < normalized.length(); i++) {
-        if (!isxdigit(static_cast<unsigned char>(normalized[i]))) return false;
-    }
-    return true;
 }
 
 // Translates a fetchDisplayBuffer() failure into a message a non-technical
@@ -169,14 +163,28 @@ String explainFetchError(const DisplayFetchResult& fetch) {
 // combined) -- see CLAUDE.md for why that mattered on real hardware.
 // Invariant: this function must NEVER touch `server` (WebServer isn't
 // thread-safe) -- only setValidationProgress()/the mutex-protected state.
+const char* probeErrorToString(TlsFingerprintProbeError err) {
+    switch (err) {
+        case TlsFingerprintProbeError::None: return "OK";
+        case TlsFingerprintProbeError::UrlNotHttps: return "URL_NOT_HTTPS";
+        case TlsFingerprintProbeError::ConnectFailed: return "TLS_CONNECT_FAILED";
+        case TlsFingerprintProbeError::FingerprintUnavailable: return "NO_PEER_CERT";
+    }
+    return "UNKNOWN";
+}
+
 void validationTask(void* param) {
     DeviceConfig* candidate = static_cast<DeviceConfig*>(param);
+
+    Serial1.printf("[PORTAL] Validating: ssid='%s' url='%s'\n", candidate->wifiSsid.c_str(),
+                    candidate->apiBaseUrl.c_str());
 
     WifiFastConnect scratch;
     wifiBeginConnect(candidate->wifiSsid.c_str(), candidate->wifiPassword.c_str(), scratch);
     const bool wifiOk =
         wifiWaitConnected(scratch, PORTAL_VALIDATE_WIFI_TIMEOUT_MS, PORTAL_VALIDATE_WIFI_TIMEOUT_MS);
     if (!wifiOk) {
+        Serial1.println("[PORTAL] Validation failed: WiFi did not connect.");
         WiFi.disconnect(false);  // drop the STA attempt only, keep the AP alive
         setValidationProgress(ValidationStage::Failed,
                                "No se pudo conectar a esa wifi (SSID/contraseña incorrectos o "
@@ -185,15 +193,100 @@ void validationTask(void* param) {
         vTaskDelete(nullptr);
         return;  // unreachable; vTaskDelete(nullptr) never returns
     }
+    Serial1.printf("[PORTAL] WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+
+    const bool isHttps = candidate->apiBaseUrl.startsWith("https://");
+    if (isHttps) {
+        // Trust-on-first-use: connect with zero verification, show the
+        // human what certificate the server actually presented, and only
+        // pin it if they confirm. probeTlsFingerprintInsecure() is
+        // strictly TOFU-only -- the real pinned check happens below via
+        // fetchDisplayBuffer() once a fingerprint has been confirmed.
+        setValidationProgress(ValidationStage::FetchingCertificate,
+                               "Conectado a la wifi. Obteniendo el certificado del servidor...");
+        Serial1.printf("[PORTAL] Probing TLS certificate at %s ...\n", candidate->apiBaseUrl.c_str());
+        const unsigned long probeStart = millis();
+        const TlsFingerprintProbeResult probe = probeTlsFingerprintInsecure(candidate->apiBaseUrl);
+        Serial1.printf("[PORTAL] TLS probe result: %s (took %lu ms)\n",
+                        probeErrorToString(probe.error),
+                        static_cast<unsigned long>(millis() - probeStart));
+        if (probe.error != TlsFingerprintProbeError::None) {
+            WiFi.disconnect(false);
+            String msg = "No se pudo obtener el certificado TLS del servidor";
+            switch (probe.error) {
+                case TlsFingerprintProbeError::ConnectFailed:
+                    msg += " (no respondió la conexión TLS -- revisa la URL, el puerto y que esté "
+                           "encendido).";
+                    break;
+                case TlsFingerprintProbeError::FingerprintUnavailable:
+                    msg += " (conectó pero no se pudo leer el certificado del servidor).";
+                    break;
+                default:
+                    msg += " (revisa que la URL empiece por https://).";
+                    break;
+            }
+            setValidationProgress(ValidationStage::Failed, msg);
+            delete candidate;
+            vTaskDelete(nullptr);
+            return;  // unreachable; vTaskDelete(nullptr) never returns
+        }
+        Serial1.printf("[PORTAL] Certificate fingerprint: %s\n", probe.fingerprintHex.c_str());
+
+        portENTER_CRITICAL(&g_validationMux);
+        g_validationState.stage = ValidationStage::AwaitingFingerprintConfirmation;
+        g_validationState.pendingFingerprint = probe.fingerprintHex;
+        g_validationState.decision = FingerprintDecision::Pending;
+        g_validationState.message =
+            "El certificado del servidor es autofirmado. Confirma que el fingerprint es correcto.";
+        portEXIT_CRITICAL(&g_validationMux);
+
+        const unsigned long waitStart = millis();
+        FingerprintDecision decision = FingerprintDecision::Pending;
+        while (decision == FingerprintDecision::Pending) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            decision = snapshotValidationState().decision;
+            if (decision == FingerprintDecision::Pending &&
+                millis() - waitStart > PORTAL_FINGERPRINT_CONFIRM_TIMEOUT_MS) {
+                break;
+            }
+        }
+
+        if (decision == FingerprintDecision::Pending) {
+            Serial1.println("[PORTAL] Fingerprint confirmation timed out.");
+            WiFi.disconnect(false);
+            setValidationProgress(ValidationStage::Failed,
+                                   "No se confirmó el fingerprint a tiempo. Vuelve a intentarlo.");
+            delete candidate;
+            vTaskDelete(nullptr);
+            return;  // unreachable; vTaskDelete(nullptr) never returns
+        }
+        if (decision == FingerprintDecision::Rejected) {
+            Serial1.println("[PORTAL] Fingerprint rejected by user.");
+            WiFi.disconnect(false);
+            setValidationProgress(ValidationStage::Failed,
+                                   "Fingerprint rechazado. Revisa que la URL apunte al servidor "
+                                   "correcto e inténtalo de nuevo.");
+            delete candidate;
+            vTaskDelete(nullptr);
+            return;  // unreachable; vTaskDelete(nullptr) never returns
+        }
+
+        Serial1.println("[PORTAL] Fingerprint confirmed by user.");
+        candidate->tlsFingerprint = probe.fingerprintHex;  // Confirmed
+    }
 
     setValidationProgress(ValidationStage::TestingEndpoint, "Conectado a la wifi. Probando el servidor...");
 
     // Same fetchDisplayBuffer() the normal hourly cycle uses -- one HTTP
-    // client code path, exercised for real here.
+    // client code path, exercised for real here. For https this re-does
+    // the TLS handshake, this time actually pinned against the
+    // just-confirmed fingerprint, and also exercises the Bearer token.
     const DisplayEndpointConfig ep{candidate->apiBaseUrl, candidate->apiAuthToken,
                                     candidate->tlsFingerprint};
     DisplayFetchResult fetch = fetchDisplayBuffer(ep, /*batteryPercent=*/50);
     const bool fetchOk = fetch.ok();
+    Serial1.printf("[PORTAL] Endpoint test result: %s (http=%d)\n", toString(fetch.error),
+                    fetch.httpStatus);
     const String errorMessage = fetchOk ? String() : explainFetchError(fetch);
     fetch.free();
     WiFi.disconnect(false);
@@ -205,6 +298,7 @@ void validationTask(void* param) {
         return;  // unreachable; vTaskDelete(nullptr) never returns
     }
 
+    Serial1.println("[PORTAL] Validation OK, saving config.");
     setValidationProgress(ValidationStage::Success, "Configuración verificada. Guardando y reiniciando...");
     device_config::save(*candidate);
     delete candidate;
@@ -226,8 +320,11 @@ void validationTask(void* param) {
 void tryStartValidation(const DeviceConfig& candidate) {
     portENTER_CRITICAL(&g_validationMux);
     const bool alreadyRunning = g_validationState.stage == ValidationStage::ConnectingWifi ||
+                                 g_validationState.stage == ValidationStage::FetchingCertificate ||
+                                 g_validationState.stage == ValidationStage::AwaitingFingerprintConfirmation ||
                                  g_validationState.stage == ValidationStage::TestingEndpoint;
     if (!alreadyRunning) {
+        g_validationState = ValidationState{};
         g_validationState.stage = ValidationStage::ConnectingWifi;
         g_validationState.message = "Conectando a la red wifi...";
         g_validationState.candidate = candidate;
@@ -277,10 +374,6 @@ String renderFormPage(const DeviceConfig& values, const String& message, bool is
         ".ok{background:#e6f4ea;color:#1e4620;}"
         ".hint{color:#666;font-size:13px;margin-top:4px;}"
         "button{margin-top:20px;padding:10px 16px;font-size:16px;}"
-        ".secondary{margin-top:24px;padding-top:12px;border-top:1px solid #ddd;font-size:13px;"
-        "color:#666;}"
-        ".secondary label{display:inline;font-weight:normal;}"
-        ".secondary input{width:auto;}"
         "</style></head><body><h2>Configura el dispositivo</h2>";
 
     if (message.length() > 0) {
@@ -299,30 +392,19 @@ String renderFormPage(const DeviceConfig& values, const String& message, bool is
             "\" placeholder=\"https://mi-servidor:8443\" required>";
     html += "<label>Token</label><input name=\"token\" value=\"" +
             htmlEscape(values.apiAuthToken) + "\" required>";
-    html += "<label>Fingerprint SHA-256 del certificado (si es https)</label>"
-            "<input name=\"fp\" value=\"" +
-            htmlEscape(values.tlsFingerprint) + "\" placeholder=\"AA:BB:CC:...\">";
-    html += "<div class=\"hint\">Cópialo desde /api/v1/tls-cert en tu backend.</div>";
+    html += "<div class=\"hint\">Si la URL es https, el dispositivo obtendrá el certificado del "
+            "servidor y te pedirá que confirmes su fingerprint durante la verificación.</div>";
     html += "<button type=\"submit\">Guardar y verificar</button>";
-    html += "<div class=\"secondary\"><label><input type=\"checkbox\" name=\"save_anyway\" "
-            "value=\"1\"> Guardar de todas formas aunque falle la verificación</label></div>";
     html += "</form></body></html>";
     return html;
-}
-
-String renderSavedPage() {
-    return "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\">"
-           "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-           "<title>Guardado</title></head><body style=\"font-family:sans-serif;"
-           "max-width:480px;margin:40px auto;padding:0 16px;text-align:center;\">"
-           "<h2>Configuración guardada</h2><p>El dispositivo se está reiniciando...</p>"
-           "</body></html>";
 }
 
 const char* stageToJsonToken(ValidationStage stage) {
     switch (stage) {
         case ValidationStage::Idle: return "idle";
         case ValidationStage::ConnectingWifi: return "connecting_wifi";
+        case ValidationStage::FetchingCertificate: return "fetching_certificate";
+        case ValidationStage::AwaitingFingerprintConfirmation: return "awaiting_fingerprint_confirmation";
         case ValidationStage::TestingEndpoint: return "testing_endpoint";
         case ValidationStage::Success: return "success";
         case ValidationStage::Failed: return "failed";
@@ -374,14 +456,42 @@ String renderValidatingPage() {
            ".err{background:#fdecea;color:#611a15;}"
            ".ok{background:#e6f4ea;color:#1e4620;}"
            ".hint{color:#666;font-size:13px;margin-top:12px;}"
+           "code{display:block;font-family:monospace;word-break:break-all;background:#f4f4f4;"
+           "padding:8px;border-radius:6px;margin-top:8px;}"
+           "button{margin-top:12px;margin-right:8px;padding:10px 16px;font-size:16px;}"
            "</style></head><body><h2>Verificando la configuración</h2>"
            "<div id=\"status\" class=\"msg\">Conectando a la red wifi...</div>"
+           "<div id=\"fpConfirm\" style=\"display:none\">"
+           "<code id=\"fpValue\"></code>"
+           "<button id=\"fpConfirmBtn\">Confirmar</button>"
+           "<button id=\"fpRejectBtn\">Rechazar</button>"
+           "</div>"
            "<div id=\"slow\" class=\"hint\" style=\"display:none\">Esto está tardando más de lo "
            "normal -- comprueba que tu móvil sigue conectado al hotspot del dispositivo.</div>"
            "<p id=\"retryLink\" style=\"display:none\"><a href=\"/\">Volver e intentar de nuevo</a></p>"
            "<script>"
            "var startedAt = Date.now();"
            "var slowWarned = false;"
+           "var decisionSent = false;"
+           "function setFpButtonsDisabled(v) {"
+           "  document.getElementById('fpConfirmBtn').disabled = v;"
+           "  document.getElementById('fpRejectBtn').disabled = v;"
+           "}"
+           "function sendDecision(decision) {"
+           "  if (decisionSent) return;"
+           "  decisionSent = true;"
+           "  setFpButtonsDisabled(true);"
+           "  fetch('/validate-confirm', {"
+           "    method: 'POST',"
+           "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
+           "    body: 'decision=' + decision"
+           "  }).catch(function() {"
+           "    decisionSent = false;"
+           "    setFpButtonsDisabled(false);"
+           "  });"
+           "}"
+           "document.getElementById('fpConfirmBtn').onclick = function() { sendDecision('confirm'); };"
+           "document.getElementById('fpRejectBtn').onclick = function() { sendDecision('reject'); };"
            "function poll() {"
            "  var controller = new AbortController();"
            "  var timeoutId = setTimeout(function() { controller.abort(); }, 4000);"
@@ -391,6 +501,17 @@ String renderValidatingPage() {
            "      clearTimeout(timeoutId);"
            "      var el = document.getElementById('status');"
            "      el.textContent = data.message || '...';"
+           "      if (data.stage === 'awaiting_fingerprint_confirmation') {"
+           "        if (!decisionSent) {"
+           "          document.getElementById('fpValue').textContent = data.fingerprint || '';"
+           "          document.getElementById('fpConfirm').style.display = 'block';"
+           "        }"
+           "        document.getElementById('slow').style.display = 'none';"
+           "        startedAt = Date.now();"  // waiting on a human, not stuck -- don't count it
+           "        setTimeout(poll, 1000);"
+           "        return;"
+           "      }"
+           "      document.getElementById('fpConfirm').style.display = 'none';"
            "      if (data.stage === 'failed') {"
            "        el.className = 'msg err';"
            "        document.getElementById('retryLink').style.display = 'block';"
@@ -422,7 +543,10 @@ void handleRoot() {
         server.send(200, "text/html", renderFormPage(snap.candidate, snap.message, true));
         return;
     }
-    if (snap.stage == ValidationStage::ConnectingWifi || snap.stage == ValidationStage::TestingEndpoint) {
+    if (snap.stage == ValidationStage::ConnectingWifi ||
+        snap.stage == ValidationStage::FetchingCertificate ||
+        snap.stage == ValidationStage::AwaitingFingerprintConfirmation ||
+        snap.stage == ValidationStage::TestingEndpoint) {
         // A validation is already in flight (user navigated back to / or
         // reopened the page) -- keep them on the progress view instead of
         // a blank form that would invite a redundant resubmit.
@@ -446,8 +570,9 @@ void handleSave() {
     }
     candidate.apiAuthToken = server.arg("token");
     candidate.apiAuthToken.trim();
-    candidate.tlsFingerprint = normalizeFingerprint(server.arg("fp"));
-    const bool saveAnyway = server.hasArg("save_anyway");
+    // tlsFingerprint is never entered manually -- for https it's always
+    // obtained and confirmed interactively during validation (TOFU, see
+    // validationTask()).
 
     const bool isHttps = candidate.apiBaseUrl.startsWith("https://");
     const bool isHttp = candidate.apiBaseUrl.startsWith("http://");
@@ -467,28 +592,12 @@ void handleSave() {
         server.send(200, "text/html", renderFormPage(candidate, "Falta el token.", true));
         return;
     }
-    if (isHttps && !isValidFingerprint(candidate.tlsFingerprint)) {
-        server.send(200, "text/html",
-                     renderFormPage(candidate,
-                                     "El fingerprint debe tener 64 caracteres hexadecimales "
-                                     "(con o sin ':').",
-                                     true));
-        return;
-    }
 
-    if (saveAnyway) {
-        // No network to test -- nothing to run in the background, save
-        // and restart synchronously exactly like before.
-        device_config::save(candidate);
-        server.send(200, "text/html", renderSavedPage());
-        server.client().flush();
-        delay(1500);  // give the response time to actually reach the phone
-        WiFi.softAPdisconnect(true);
-        wifiDisconnect();
-        ESP.restart();
-        while (true) delay(1000);  // unreachable
-    }
-
+    // No "save anyway" escape hatch: the config is only ever persisted
+    // after live validation succeeds (including, for https, an explicit
+    // human confirmation of the server's certificate) -- see
+    // validationTask().
+    //
     // Validation itself (WiFi connect + HTTPS test, up to ~23s combined)
     // runs on a background task -- see validationTask() -- so this
     // handler returns immediately and the phone gets progress via polling
@@ -503,8 +612,20 @@ void handleValidateStatus() {
     touchActivity();
     const ValidationState snap = snapshotValidationState();
     const String json = String("{\"stage\":\"") + stageToJsonToken(snap.stage) + "\",\"message\":\"" +
-                         jsonEscape(snap.message) + "\"}";
+                         jsonEscape(snap.message) + "\",\"fingerprint\":\"" +
+                         jsonEscape(snap.pendingFingerprint) + "\"}";
     server.send(200, "application/json", json);
+}
+
+void handleValidateConfirm() {
+    touchActivity();
+    const String decision = server.arg("decision");
+    if (decision == "confirm") {
+        trySetFingerprintDecision(FingerprintDecision::Confirmed);
+    } else if (decision == "reject") {
+        trySetFingerprintDecision(FingerprintDecision::Rejected);
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void redirectToPortalRoot() {
@@ -547,6 +668,7 @@ namespace setup_portal {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/validate-status", HTTP_GET, handleValidateStatus);
+    server.on("/validate-confirm", HTTP_POST, handleValidateConfirm);
     registerCaptivePortalRoutes();
     server.begin();
 

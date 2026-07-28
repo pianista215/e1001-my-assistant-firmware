@@ -102,6 +102,13 @@ constexpr uint32_t PORTAL_RETRY_SLEEP_SEC = 5 * 60;
 // Timeout for the STA connection attempted live during setup validation
 // (no cached BSSID/channel yet, so always the "full" timeout).
 constexpr unsigned long PORTAL_VALIDATE_WIFI_TIMEOUT_MS = 15000;
+// How long to wait for a human to confirm/reject a TOFU TLS fingerprint
+// before giving up (see setup_portal.cpp). Deliberately generous -- this
+// is a real trust decision (accepting a self-signed cert for the first
+// time), not something to rush, and the portal's own polling keeps
+// PORTAL_INACTIVITY_TIMEOUT_MS from firing on its own while this is
+// pending.
+constexpr uint32_t PORTAL_FINGERPRINT_CONFIRM_TIMEOUT_MS = 5UL * 60 * 1000;
 
 // ---- Provisioning SoftAP ----
 constexpr const char* AP_SSID_PREFIX = "E1001-Setup-";

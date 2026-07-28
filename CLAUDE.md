@@ -237,10 +237,12 @@ llama a la **misma** `fetchDisplayBuffer()` de producción con
 y la validación del portal. Cada tipo de fallo (wifi, TLS, fingerprint no
 coincide, 401, otro HTTP status, formato de respuesta inesperado) se
 traduce a un mensaje específico en la web, con el formulario prerellenado
-para corregir sin perder el hotspot. Un checkbox "guardar de todas formas"
-permite saltarse la validación como escape hatch secundario. Importante:
-durante esta validación nunca se llama a `wifiDisconnect()` (que hace
-`WiFi.mode(WIFI_OFF)` y tiraría también el AP) — se usa
+para corregir sin perder el hotspot. No hay ningún escape hatch de
+"guardar sin probar" — el usuario decidió deliberadamente que la
+config solo se persiste tras una validación en vivo exitosa (incluyendo,
+para HTTPS, la confirmación humana del certificado — ver más abajo).
+Importante: durante esta validación nunca se llama a `wifiDisconnect()`
+(que hace `WiFi.mode(WIFI_OFF)` y tiraría también el AP) — se usa
 `WiFi.disconnect(false)` para soltar solo el lado STA.
 
 **Hallazgo real con el dispositivo (validación bloqueaba el portal)**: en
@@ -265,7 +267,8 @@ atendiendo `dnsServer.processNextRequest()`/`server.handleClient()` sin
 bloqueos largos. Un estado compartido (`ValidationStage` +
 `ValidationState`, protegido con un spinlock `portMUX_TYPE`, ya que se
 lee/escribe desde la tarea de fondo y desde los handlers HTTP del loop
-principal) expone `Idle → ConnectingWifi → TestingEndpoint →
+principal) expone `Idle → ConnectingWifi → [FetchingCertificate →
+AwaitingFingerprintConfirmation, solo si https] → TestingEndpoint →
 Success`/`Failed`; `handleSave()` ahora responde al instante con una
 página que hace polling a `GET /validate-status` (JSON) cada ~1s vía
 `fetch()` con su propio `AbortController` de 4s (sin esto, un poll que se
@@ -291,18 +294,76 @@ tocar.
 
 **Fingerprint TLS**: `display_client.cpp` conecta con `WiFiClientSecure`
 usando `setInsecure()` (sin cadena de CA — el pinning por fingerprint
-reemplaza la verificación de cadena) y `.verify(fingerprintHex, host)`
+reemplaza la verificación de cadena) y `.verify(fingerprintHex, nullptr)`
 **antes** de `http.begin(secureClient, url)`; `HTTPClient::connect()`
 reutiliza un cliente ya conectado (visto en el `.cpp` del core instalado),
-así que no hay un segundo handshake sin verificar. El fingerprint que
-pega el usuario se normaliza (`normalizeFingerprint()`: quita `:` y
-espacios, pasa a mayúsculas) antes de guardarse y de usarse — el parser de
-`verify_ssl_fingerprint()` del core Arduino-ESP32 2.0.17 tolera tanto
-`:` como ausencia de separadores, así que no hace falta reconvertir. El
-backend `my-assistant` ya expone este mismo fingerprint (formato
-`openssl x509 -fingerprint -sha256`) sin autenticación en
-`GET /api/v1/tls-cert`, pensado exactamente para copiarlo desde el móvil
-durante el setup.
+así que no hay un segundo handshake sin verificar. El backend
+`my-assistant` calcula este mismo fingerprint (formato
+`openssl x509 -fingerprint -sha256`) y lo expone sin autenticación en
+`GET /api/v1/tls-cert` — pensado originalmente para copiarlo a mano desde
+el móvil, aunque desde la confirmación interactiva TOFU (ver más abajo)
+ya no hace falta: el propio dispositivo lo obtiene y lo muestra.
+
+**Confirmación interactiva del fingerprint (TOFU)**: el usuario decidió
+que copiar el fingerprint a mano era fricción innecesaria (el propio
+backend es quien genera el certificado autofirmado), así que el campo
+manual del formulario se quitó por completo — para HTTPS, `handleSave()`
+siempre deja `tlsFingerprint` vacío y `validationTask()` lo resuelve solo:
+tras conectar la wifi, `probeTlsFingerprintInsecure()` (`display_client.h`/
+`.cpp`) conecta por TLS con `setInsecure()` y **cero verificación, ni
+siquiera de fingerprint** — deliberadamente, es una función *solo* para
+este flujo TOFU, nunca para el ciclo normal — y devuelve el fingerprint
+real vía `WiFiClientSecure::getFingerprintSHA256()`. Ese fingerprint se
+publica en el estado compartido (stage `AwaitingFingerprintConfirmation`,
+campo `pendingFingerprint`) y la web lo muestra con dos botones
+("Confirmar"/"Rechazar"); `validationTask()` se queda esperando la
+decisión con un polling propio (`vTaskDelay(300ms)` sobre un nuevo campo
+`FingerprintDecision decision`, mismo `portMUX_TYPE` que el resto del
+estado — no hace falta un semáforo/cola nuevo, la decisión depende de que
+un humano toque un botón, así que 300ms de latencia interna son
+irrelevantes) hasta que cambie o expire
+`PORTAL_FINGERPRINT_CONFIRM_TIMEOUT_MS` (5 min — es una decisión de
+confianza real, no hay que apresurarla, y el polling de
+`/validate-status` desde el móvil sigue refrescando `g_lastActivity` vía
+`touchActivity()` mientras tanto, así que el timeout global de 10 min del
+portal no se dispara solo por la espera de esta confirmación). Si
+confirma, ese fingerprint queda fijado en `candidate.tlsFingerprint` y el
+flujo sigue exactamente igual que antes (`fetchDisplayBuffer()` ya
+pinneado de verdad, validando también el token); si rechaza o expira el
+plazo, `Failed` sin guardar nada. `POST /validate-confirm`
+(`handleValidateConfirm()`) es el endpoint nuevo que recibe la decisión
+del móvil; `trySetFingerprintDecision()` solo la aplica si el estado sigue
+en `AwaitingFingerprintConfirmation`, para que una confirmación duplicada
+o tardía (p.ej. un reintento del navegador tras un timeout del propio
+JS) no contamine un intento ya cerrado o reiniciado.
+
+**Hallazgo real con el dispositivo (`WiFiClientSecure::setTimeout()` en
+segundos, no ms)**: al probar la confirmación TOFU en hardware real, el
+paso "Obteniendo el certificado del servidor..." se quedaba colgado (o
+tardaba muchísimo en dar error) en vez de fallar en unos segundos como
+documentaba `fetchDisplayBuffer()`. Causa: `WiFiClientSecure::setTimeout
+(uint32_t seconds)` recibe **segundos**, no milisegundos —a diferencia de
+`HTTPClient::setTimeout()`, que sí hace la conversión internamente
+(`(timeout + 500) / 1000` antes de llamar al `Client` subyacente, visto en
+`HTTPClient.cpp`)—. Tanto `fetchDisplayBuffer()` como
+`probeTlsFingerprintInsecure()` (`display_client.cpp`) llamaban a
+`secureClient.setTimeout(HTTP_TIMEOUT_MS)` pasando `8000` directamente, lo
+que el core interpretaba como **8000 segundos** (~2h13min) en vez de 8s.
+Además, `sslclient->handshake_timeout` (el timeout de la fase de
+handshake TLS en sí, separado del timeout de conexión TCP) tiene su
+propio default de 120000ms y nunca se tocaba, así que aunque el `connect()`
+TCP fuera rápido, un handshake que se atascara (p.ej. coincidiendo con el
+salto de canal del AP en `WIFI_AP_STA` — ver más arriba) podía tardar
+hasta 2 minutos en fallar. Arreglado llamando a
+`secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000)` **y**
+`secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000)` (esta última
+también en segundos) en ambos sitios, acotando de verdad todo el
+handshake HTTPS al presupuesto de `HTTP_TIMEOUT_MS` documentado. De paso
+se añadió logging por `Serial1` en `validationTask()` (SSID/URL al
+empezar, resultado y duración del probe TLS, fingerprint obtenido,
+resultado de la confirmación, resultado final de `fetchDisplayBuffer()`)
+para poder diagnosticar sin ambigüedad si algo vuelve a fallar durante el
+setup.
 
 **Hallazgo real con el dispositivo (primer flasheo con endpoint HTTPS)**:
 `.verify(fingerprint, host)` de este core encadena dos comprobaciones —

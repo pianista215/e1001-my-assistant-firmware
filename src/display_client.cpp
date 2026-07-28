@@ -168,7 +168,15 @@ DisplayFetchResult fetchDisplayBuffer(const DisplayEndpointConfig& cfg, int batt
     bool began = false;
     if (parts.isHttps) {
         secureClient.setInsecure();  // no CA chain -- fingerprint pinning replaces it
-        secureClient.setTimeout(HTTP_TIMEOUT_MS);
+        // WiFiClientSecure::setTimeout() takes SECONDS, not ms (unlike
+        // HTTPClient::setTimeout(), which converts internally) -- passing
+        // the ms constant directly here used to mean an ~8000-SECOND
+        // socket timeout instead of 8, so an unreachable host/port would
+        // hang for over 2 hours instead of failing in HTTP_TIMEOUT_MS as
+        // documented. setHandshakeTimeout() has the same seconds unit and
+        // its own 120s default, which needed bounding too.
+        secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+        secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
         if (!secureClient.connect(parts.host.c_str(), parts.port)) {
             result.error = DisplayFetchError::TlsConnectFailed;
             return result;
@@ -291,5 +299,38 @@ DisplayFetchResult fetchDisplayBuffer(const DisplayEndpointConfig& cfg, int batt
     result.pixels = buf + kHeaderLen;
     result.width = width;
     result.height = height;
+    return result;
+}
+
+TlsFingerprintProbeResult probeTlsFingerprintInsecure(const String& baseUrl) {
+    TlsFingerprintProbeResult result;
+
+    UrlParts parts;
+    if (!splitUrl(baseUrl, parts) || !parts.isHttps) {
+        result.error = TlsFingerprintProbeError::UrlNotHttps;
+        return result;
+    }
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // deliberate: TOFU probe, no verification at all
+    // See the matching comment in fetchDisplayBuffer(): both timeouts here
+    // are in SECONDS, not ms.
+    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
+    if (!secureClient.connect(parts.host.c_str(), parts.port)) {
+        result.error = TlsFingerprintProbeError::ConnectFailed;
+        return result;
+    }
+
+    uint8_t actual[32];
+    if (!secureClient.getFingerprintSHA256(actual)) {
+        secureClient.stop();
+        result.error = TlsFingerprintProbeError::FingerprintUnavailable;
+        return result;
+    }
+
+    secureClient.stop();
+    result.error = TlsFingerprintProbeError::None;
+    result.fingerprintHex = fingerprintToHex(actual);
     return result;
 }

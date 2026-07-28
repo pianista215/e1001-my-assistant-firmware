@@ -70,3 +70,24 @@ struct DisplayEndpointConfig {
 // completes or HTTP_TIMEOUT_MS elapses -- never hangs indefinitely, since
 // this runs unattended on battery.
 DisplayFetchResult fetchDisplayBuffer(const DisplayEndpointConfig& cfg, int batteryPercent);
+
+// TOFU only: connects via TLS with zero verification (not even a
+// fingerprint check) and returns whatever the server presents. Exists
+// solely so the setup portal can show a human the certificate's
+// fingerprint and have them confirm it before it's ever pinned. Never use
+// this to obtain or trust a fingerprint for anything else -- the normal
+// hourly cycle (fetchDisplayBuffer()) always requires an already-pinned
+// fingerprint and verifies it strictly before doing anything else.
+enum class TlsFingerprintProbeError {
+    None,
+    UrlNotHttps,
+    ConnectFailed,
+    FingerprintUnavailable,
+};
+
+struct TlsFingerprintProbeResult {
+    TlsFingerprintProbeError error = TlsFingerprintProbeError::ConnectFailed;
+    String fingerprintHex;  // valid only when error == None
+};
+
+TlsFingerprintProbeResult probeTlsFingerprintInsecure(const String& baseUrl);
