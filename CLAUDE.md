@@ -11,7 +11,11 @@ Firmware ESP32 (Seeed reTerminal E1001) que cada hora: conecta a WiFi, lee
 su batería, pide una imagen ya renderizada al backend `my-assistant`
 (`../my-assistant` en este mismo checkout), la pinta en el panel e-ink de
 800×480 4 grises, y se vuelve a dormir. Sin `loop()` real: `setup()` hace
-todo el ciclo y termina siempre en `esp_deep_sleep_start()`.
+todo el ciclo y termina siempre en `esp_deep_sleep_start()` — con una
+excepción: si no hay configuración WiFi/endpoint guardada todavía (o el
+usuario la ha borrado con un gesto físico de reset), `setup()` entra en un
+portal de aprovisionamiento (SoftAP + web) en vez del ciclo normal — ver
+"Decisión de diseño: provisioning inicial" más abajo.
 
 ## Contrato de la API (my-assistant)
 
@@ -101,8 +105,8 @@ Enfoque (`main.cpp` + `rtc_pcf8563.cpp`):
    red). Si el flag VL (voltage-low) está activo, la hora no es fiable y se
    ignora.
 2. Tras conectar WiFi: intentar SNTP (`configTzTime` + `getLocalTime`,
-   timeout corto). Si funciona, es autoritativo — se re-escribe al PCF8563
-   para que el drift no se acumule ciclo a ciclo.
+   timeout `SNTP_SYNC_TIMEOUT_MS`). Si funciona, es autoritativo — se
+   re-escribe al PCF8563 para que el drift no se acumule ciclo a ciclo.
 3. Si SNTP falla pero el PCF8563 dio hora válida este ciclo, o si ya se
    sincronizó alguna vez desde el último power-on (el reloj del sistema del
    ESP32 sigue avanzando solo entre ciclos de deep sleep), se usa
@@ -121,6 +125,19 @@ estado en RAM pueden hacer.
 el drift cada vez que hay red, en vez de implementar lógica de "cuánto ha
 pasado desde la última sincronización" para decidir cuándo re-sincronizar.
 
+**Hallazgo real con el dispositivo**: `SNTP_SYNC_TIMEOUT_MS` empezó en
+3000ms y resultó demasiado ajustado en la práctica — en una red con
+internet real confirmado, la primera sincronización SNTP de un ciclo
+(resolución DNS de `pool.ntp.org` + ida y vuelta del paquete NTP) puede
+tardar más de eso, así que el dispositivo caía en la rama de "sin hora
+fiable todavía" (`FIRST_BOOT_RETRY_SLEEP_SEC`, 5 min de espera) en ciclos
+donde SNTP habría funcionado con un poco más de margen — confirmado
+forzando un segundo ciclo con el botón, que sí sincronizó. Subido a
+8000ms: no penaliza el caso normal (una sync exitosa no tarda más por
+tener más presupuesto disponible) y evita gastar un ciclo entero de
+reintento (con su propia reconexión WiFi) por una sync que solo necesitaba
+unos segundos más.
+
 ## Decisión de diseño: botón físico de refresco manual
 
 `main.cpp` habilita `esp_sleep_enable_ext1_wakeup()` sobre `PIN_WAKE_BUTTON`
@@ -132,6 +149,13 @@ activas a la vez; la que ocurra primero gana. Esto permite forzar un
 refresco inmediato (o reintentar tras arreglar WiFi/config) sin esperar al
 temporizador. El ciclo que se ejecuta al despertar es idéntico venga de
 donde venga — solo cambia el log de `wakeupCauseString()` al inicio.
+
+Desde el aprovisionamiento inalámbrico (ver la sección correspondiente más
+abajo), esto tiene una excepción: si el dispositivo ya está configurado y
+despierta por este botón, `main.cpp` espera hasta `RESET_HOLD_MS` (10s)
+antes de lanzar el refresco, por si la pulsación es en realidad el gesto
+de reset. Una pulsación corta sigue comportándose exactamente igual que
+antes; solo se añade ese retraso de comprobación.
 
 **Impacto en consumo**: mínimo. El propio dato de ~14µA que reporta Seeed
 para esta familia de placas viene de ese mismo ejemplo, que ya tiene el
@@ -158,31 +182,241 @@ tarde/pronto, o aunque el primer arranque no caiga justo en hora en punto.
 
 ## Config por dispositivo
 
-`platformio.ini` usa `extra_configs = secrets.ini` (ver
-`secrets.ini.example`) para inyectar `WIFI_SSID`, `WIFI_PASSWORD`,
-`API_BASE_URL`, `API_AUTH_TOKEN`, `TZ_STRING` como flags `-D` — quedan
-disponibles como macros en cualquier `.cpp` sin incluir ningún header
-generado. `secrets.ini` está gitignored; `.example` no. `config.h` tiene
-`#error` guards si alguno falta.
+Solo `TZ_STRING` (y el flag opcional de desarrollo
+`DEBUG_SLEEP_OVERRIDE_SEC`) siguen siendo compile-time: `platformio.ini`
+usa `extra_configs = secrets.ini` (ver `secrets.ini.example`) para
+inyectarlos como flags `-D`. `secrets.ini` está gitignored; `.example` no.
+`config.h` tiene un `#error` guard solo para `TZ_STRING`.
 
-Decisión ya tomada con el usuario: **HTTP plano** (red local/VPN), no
-HTTPS — el firmware no implementa `WiFiClientSecure`. Si en algún momento
-el backend pasa a tener TLS con dominio público, `display_client.cpp` es el
-único sitio que necesitaría cambiar (usar `WiFiClientSecure` + verificación
-de certificado en vez de `WiFiClient` plano vía `HTTPClient`).
+WiFi (SSID/contraseña), la URL del endpoint, el token de autenticación y
+(si el endpoint es HTTPS) el fingerprint SHA-256 del certificado ya **no**
+son secretos de compilación — se introducen una vez a través del portal de
+aprovisionamiento inalámbrico (ver la siguiente sección) y se guardan en
+NVS vía `Preferences` (`device_config.{h,cpp}`, namespace `"e1001cfg"`),
+que sobrevive a un power-on/EN reset real (a diferencia del
+`RTC_DATA_ATTR PersistentState g_state` de `sleep_state.h`, que solo
+sobrevive deep sleep). `main.cpp` carga esa config con
+`device_config::load()` al principio de cada ciclo normal.
+
+El endpoint puede ser `http://` (red local/VPN, sin TLS) o `https://` (cert
+autofirmado del backend `my-assistant`, con fingerprint pinning — ver
+`display_client.cpp`). Ya no hay una decisión fija de "solo HTTP": el
+scheme de la URL guardada decide el transporte en cada petición.
+
+## Decisión de diseño: provisioning inicial (SoftAP + QR + fingerprint TLS)
+
+Sin config guardada (`device_config::isConfigured()` false — primer
+arranque real, o tras el gesto de reset descrito más abajo),
+`setup_portal::run()` toma el control de `setup()` y **no vuelve**: es el
+único sitio del firmware donde hay un bucle activo con el radio encendido
+en vez de terminar en deep sleep inmediatamente.
+
+Flujo: `WiFi.mode(WIFI_AP_STA)` (nunca `WIFI_AP` a secas — hace falta STA
+simultáneamente para la validación en vivo, ver abajo) → `WiFi.softAP()`
+con SSID `E1001-Setup-<hex chip id>` y contraseña WPA2 de 12 caracteres,
+ambos derivados deterministamente de `ESP.getEfuseMac()` (mismo QR en
+cada reintento, no cambia entre ciclos) → `DNSServer` en modo catch-all
+(`dns.start(53, "*", WiFi.softAPIP())`) + `WebServer` respondiendo 302 a
+`/` en las rutas de sondeo de captive portal de Apple/Android/Windows/
+Firefox (`/hotspot-detect.html`, `/generate_204`, `/ncsi.txt`, etc.) para
+que el móvil muestre el popup de "unirse a la red" automáticamente → se
+pinta **una vez** `eink::drawProvisioningScreen()` (QR `WIFI:T:WPA;S:...;
+P:...;;` para autoconexión desde la cámara, más SSID/contraseña/URL como
+fallback en texto) → bucle `dnsServer.processNextRequest()` +
+`server.handleClient()` hasta que el usuario complete el formulario o
+pasen `PORTAL_INACTIVITY_TIMEOUT_MS` (10 min) sin actividad, en cuyo caso
+se apaga todo y `goToSleep(PORTAL_RETRY_SLEEP_SEC)` — al despertar,
+`isConfigured()` sigue en `false` así que se reentra en el portal solo,
+sin lógica extra en `main.cpp`.
+
+**Validación en vivo antes de guardar** (`setup_portal.cpp`,
+`handleSave()`): con el AP ya activo, conecta la STA a la wifi candidata
+(`wifiBeginConnect`/`wifiWaitConnected` con caché vacía) y, si conecta,
+llama a la **misma** `fetchDisplayBuffer()` de producción con
+`battery=50` de prueba — cero lógica HTTP duplicada entre el ciclo normal
+y la validación del portal. Cada tipo de fallo (wifi, TLS, fingerprint no
+coincide, 401, otro HTTP status, formato de respuesta inesperado) se
+traduce a un mensaje específico en la web, con el formulario prerellenado
+para corregir sin perder el hotspot. No hay ningún escape hatch de
+"guardar sin probar" — el usuario decidió deliberadamente que la
+config solo se persiste tras una validación en vivo exitosa (incluyendo,
+para HTTPS, la confirmación humana del certificado — ver más abajo).
+Importante: durante esta validación nunca se llama a `wifiDisconnect()`
+(que hace `WiFi.mode(WIFI_OFF)` y tiraría también el AP) — se usa
+`WiFi.disconnect(false)` para soltar solo el lado STA.
+
+**Hallazgo real con el dispositivo (validación bloqueaba el portal)**: en
+`WIFI_AP_STA`, el ESP32 solo puede tener el AP y la STA en el mismo canal
+radio — en cuanto la STA se asocia a la wifi candidata, si está en un
+canal distinto al que el AP usaba con el móvil, el chip fuerza al AP a
+saltar a ese canal, y el móvil sufre una microdesconexión/reasociación en
+ese instante. La primera versión de `handleSave()` era totalmente
+síncrona (hasta ~23s bloqueando el único hilo de `WebServer`: 15s de
+`wifiWaitConnected` + 8s de `fetchDisplayBuffer`), así que si ese salto de
+canal coincidía con la única petición `POST /save` en curso, esa petición
+se perdía sin más reintento posible y la página se quedaba con el
+spinner sin reaccionar — confirmado por el usuario en pruebas reales
+("se ha quedado pillado el portal sin reaccionar a los botones"; el
+dispositivo en sí no se colgaba, solo esa respuesta HTTP concreta nunca
+llegaba). Arreglado moviendo la validación a una tarea FreeRTOS en segundo
+plano (`validationTask()`, `xTaskCreate` con 16384 bytes de stack —
+el doble del stack de 8192 bytes con el que `loopTask` ya ejecuta este
+mismo `fetchDisplayBuffer()` con su handshake TLS sin problema — y
+prioridad 1, igual que `loopTask`), dejando `run()` libre para seguir
+atendiendo `dnsServer.processNextRequest()`/`server.handleClient()` sin
+bloqueos largos. Un estado compartido (`ValidationStage` +
+`ValidationState`, protegido con un spinlock `portMUX_TYPE`, ya que se
+lee/escribe desde la tarea de fondo y desde los handlers HTTP del loop
+principal) expone `Idle → ConnectingWifi → [FetchingCertificate →
+AwaitingFingerprintConfirmation, solo si https] → TestingEndpoint →
+Success`/`Failed`; `handleSave()` ahora responde al instante con una
+página que hace polling a `GET /validate-status` (JSON) cada ~1s vía
+`fetch()` con su propio `AbortController` de 4s (sin esto, un poll que se
+quede a medias por el mismo salto de canal reproduciría el mismo síntoma
+de "colgado", ahora en el JS en vez de en el servidor) — si un poll falla,
+simplemente se reintenta en el siguiente ciclo en vez de mostrarse como
+error, que es la mejora de resiliencia real frente al diseño síncrono
+anterior. Invariante importante: `validationTask()` nunca toca el objeto
+`WebServer` (no es thread-safe), solo el estado protegido por el mutex.
+`tryStartValidation()` hace un check-and-set atómico para que un
+doble-tap en "Guardar" no lance dos tareas compitiendo por el WiFi a la
+vez. `handleRoot()` usa el mismo estado para prerellenar el formulario
+tras un fallo, o para devolver la página de progreso si el usuario
+navega a `/` con una validación ya en curso.
+
+**Por qué `wifiBeginConnect()` ya no fija `WiFi.mode()` internamente**:
+antes ponía `WIFI_STA` incondicionalmente; si el portal la reutilizara tal
+cual, cada intento de validación tiraría el SoftAP al que el móvil del
+usuario está conectado en ese momento. Ahora el modo lo decide quien
+llama: `main.cpp` pone `WIFI_STA` antes de llamar (ciclo normal),
+`setup_portal.cpp` ya está en `WIFI_AP_STA` desde `run()` y no lo vuelve a
+tocar.
+
+**Fingerprint TLS**: `display_client.cpp` conecta con `WiFiClientSecure`
+usando `setInsecure()` (sin cadena de CA — el pinning por fingerprint
+reemplaza la verificación de cadena) y `.verify(fingerprintHex, nullptr)`
+**antes** de `http.begin(secureClient, url)`; `HTTPClient::connect()`
+reutiliza un cliente ya conectado (visto en el `.cpp` del core instalado),
+así que no hay un segundo handshake sin verificar. El backend
+`my-assistant` calcula este mismo fingerprint (formato
+`openssl x509 -fingerprint -sha256`) y lo expone sin autenticación en
+`GET /api/v1/tls-cert` — pensado originalmente para copiarlo a mano desde
+el móvil, aunque desde la confirmación interactiva TOFU (ver más abajo)
+ya no hace falta: el propio dispositivo lo obtiene y lo muestra.
+
+**Confirmación interactiva del fingerprint (TOFU)**: el usuario decidió
+que copiar el fingerprint a mano era fricción innecesaria (el propio
+backend es quien genera el certificado autofirmado), así que el campo
+manual del formulario se quitó por completo — para HTTPS, `handleSave()`
+siempre deja `tlsFingerprint` vacío y `validationTask()` lo resuelve solo:
+tras conectar la wifi, `probeTlsFingerprintInsecure()` (`display_client.h`/
+`.cpp`) conecta por TLS con `setInsecure()` y **cero verificación, ni
+siquiera de fingerprint** — deliberadamente, es una función *solo* para
+este flujo TOFU, nunca para el ciclo normal — y devuelve el fingerprint
+real vía `WiFiClientSecure::getFingerprintSHA256()`. Ese fingerprint se
+publica en el estado compartido (stage `AwaitingFingerprintConfirmation`,
+campo `pendingFingerprint`) y la web lo muestra con dos botones
+("Confirmar"/"Rechazar"); `validationTask()` se queda esperando la
+decisión con un polling propio (`vTaskDelay(300ms)` sobre un nuevo campo
+`FingerprintDecision decision`, mismo `portMUX_TYPE` que el resto del
+estado — no hace falta un semáforo/cola nuevo, la decisión depende de que
+un humano toque un botón, así que 300ms de latencia interna son
+irrelevantes) hasta que cambie o expire
+`PORTAL_FINGERPRINT_CONFIRM_TIMEOUT_MS` (5 min — es una decisión de
+confianza real, no hay que apresurarla, y el polling de
+`/validate-status` desde el móvil sigue refrescando `g_lastActivity` vía
+`touchActivity()` mientras tanto, así que el timeout global de 10 min del
+portal no se dispara solo por la espera de esta confirmación). Si
+confirma, ese fingerprint queda fijado en `candidate.tlsFingerprint` y el
+flujo sigue exactamente igual que antes (`fetchDisplayBuffer()` ya
+pinneado de verdad, validando también el token); si rechaza o expira el
+plazo, `Failed` sin guardar nada. `POST /validate-confirm`
+(`handleValidateConfirm()`) es el endpoint nuevo que recibe la decisión
+del móvil; `trySetFingerprintDecision()` solo la aplica si el estado sigue
+en `AwaitingFingerprintConfirmation`, para que una confirmación duplicada
+o tardía (p.ej. un reintento del navegador tras un timeout del propio
+JS) no contamine un intento ya cerrado o reiniciado.
+
+**Hallazgo real con el dispositivo (`WiFiClientSecure::setTimeout()` en
+segundos, no ms)**: al probar la confirmación TOFU en hardware real, el
+paso "Obteniendo el certificado del servidor..." se quedaba colgado (o
+tardaba muchísimo en dar error) en vez de fallar en unos segundos como
+documentaba `fetchDisplayBuffer()`. Causa: `WiFiClientSecure::setTimeout
+(uint32_t seconds)` recibe **segundos**, no milisegundos —a diferencia de
+`HTTPClient::setTimeout()`, que sí hace la conversión internamente
+(`(timeout + 500) / 1000` antes de llamar al `Client` subyacente, visto en
+`HTTPClient.cpp`)—. Tanto `fetchDisplayBuffer()` como
+`probeTlsFingerprintInsecure()` (`display_client.cpp`) llamaban a
+`secureClient.setTimeout(HTTP_TIMEOUT_MS)` pasando `8000` directamente, lo
+que el core interpretaba como **8000 segundos** (~2h13min) en vez de 8s.
+Además, `sslclient->handshake_timeout` (el timeout de la fase de
+handshake TLS en sí, separado del timeout de conexión TCP) tiene su
+propio default de 120000ms y nunca se tocaba, así que aunque el `connect()`
+TCP fuera rápido, un handshake que se atascara (p.ej. coincidiendo con el
+salto de canal del AP en `WIFI_AP_STA` — ver más arriba) podía tardar
+hasta 2 minutos en fallar. Arreglado llamando a
+`secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000)` **y**
+`secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000)` (esta última
+también en segundos) en ambos sitios, acotando de verdad todo el
+handshake HTTPS al presupuesto de `HTTP_TIMEOUT_MS` documentado. De paso
+se añadió logging por `Serial1` en `validationTask()` (SSID/URL al
+empezar, resultado y duración del probe TLS, fingerprint obtenido,
+resultado de la confirmación, resultado final de `fetchDisplayBuffer()`)
+para poder diagnosticar sin ambigüedad si algo vuelve a fallar durante el
+setup.
+
+**Hallazgo real con el dispositivo (primer flasheo con endpoint HTTPS)**:
+`.verify(fingerprint, host)` de este core encadena dos comprobaciones —
+primero el fingerprint, y si coincide, además que `host` aparezca en los
+SAN/CN del certificado (`verify_ssl_dn()` en `ssl_client.cpp`). Esa segunda
+comprobación trata **todas** las entradas SAN como texto ASCII sin mirar
+su tipo ASN.1; para un SAN de tipo `iPAddress` (justo lo que genera el
+propio `my-assistant --https` para las IPs locales, ver
+`generateSelfSignedCert()` en `cmd/server/tls.go`) el contenido son 4
+bytes binarios de la IP, no el string `"192.168.x.x"` — así que la
+comprobación de host **siempre falla** para un endpoint por IP, aunque el
+fingerprint copiado sea perfecto, y `fetchDisplayBuffer()` lo reportaba
+como `TLS_FINGERPRINT` sin distinguir cuál de las dos comprobaciones había
+fallado. Confirmado con un log real: `Display fetch failed: TLS_FINGERPRINT
+(http=0)` con el fingerprint copiado tal cual desde `/api/v1/tls-cert`.
+Arreglado pasando `nullptr` como `domain_name` (`display_client.cpp`) —
+el propio código del core contempla ese caso (`if (domain_name) ... else
+return true;`) y omite la comprobación de host, que es redundante de
+todas formas: el pinning por fingerprint ya autentica el certificado
+exacto, una garantía más fuerte que comprobar un nombre/IP. Además,
+`DisplayFetchResult::actualFingerprintHex` ahora se rellena (vía
+`WiFiClientSecure::getFingerprintSHA256()`) cuando sí hay un mismatch real
+de fingerprint, y tanto `main.cpp` como el mensaje de error del portal
+(`setup_portal.cpp`) lo muestran junto al esperado, para diagnosticar sin
+ambigüedad si alguna vez vuelve a fallar de verdad.
+
+**Gesto de reset**: además del comportamiento ya descrito del botón KEY0
+(fuerza un ciclo inmediato), si el dispositivo **ya está configurado** y
+despierta por `ESP_SLEEP_WAKEUP_EXT1`, `main.cpp` no lanza el ciclo normal
+de inmediato — primero hace polling de `digitalRead(PIN_WAKE_BUTTON)`
+durante `RESET_HOLD_MS` (10s). Si se suelta antes, es una pulsación normal
+y cae al ciclo de refresco manual de siempre, sin cambios. Si sigue
+pulsado los 10s completos, se interpreta como el gesto de reset:
+`device_config::clear()` + `ESP.restart()`, que reinicia directamente en
+`setup_portal::run()` (config ya vacía). El usuario confirmó que aunque el
+chasis tiene otros dos botones físicos, deliberadamente no se usan para
+este gesto — es solo KEY0 mantenido.
 
 ## Estructura de módulos
 
 | Archivo | Responsabilidad |
 |---|---|
-| `main.cpp` | Orquestación del ciclo completo; único sitio con `RTC_DATA_ATTR PersistentState g_state`; maneja errores/backoff |
-| `config.h` | Constantes no-secretas: pines, timeouts, umbrales; valida que las secrets existan |
-| `sleep_state.h` | `struct PersistentState` (caché WiFi, contador de fallos, flag de hora sincronizada) |
-| `wifi_manager.{h,cpp}` | Reconexión rápida con caché BSSID/canal en RTC memory, fallback a scan completo |
+| `main.cpp` | Orquestación del ciclo completo; único sitio con `RTC_DATA_ATTR PersistentState g_state`; gesto de reset por hold del botón; maneja errores/backoff |
+| `config.h` | Constantes no-secretas: pines, timeouts, umbrales, constantes de aprovisionamiento; valida que `TZ_STRING` exista |
+| `sleep_state.h` | `struct PersistentState` (caché WiFi, contador de fallos, flag de hora sincronizada) — RTC memory, se borra en power-on/EN reset |
+| `sleep_control.{h,cpp}` | `goToSleep()` (timer + EXT1 wakeup, pull-up RTC) — compartido por `main.cpp` y `setup_portal.cpp` |
+| `device_config.{h,cpp}` | `struct DeviceConfig` (wifi, endpoint, token, fingerprint) sobre `Preferences`/NVS — sobrevive power-on/EN reset, a diferencia de `sleep_state.h` |
+| `setup_portal.{h,cpp}` | SoftAP + captive portal (DNSServer + WebServer) + validación en vivo + orquestación del modo aprovisionamiento; único sitio con un bucle activo (no termina en deep sleep de inmediato) |
+| `wifi_manager.{h,cpp}` | Reconexión rápida con caché BSSID/canal en RTC memory, fallback a scan completo; ya no fija `WiFi.mode()` internamente |
 | `battery.{h,cpp}` | Lectura ADC GPIO1/GPIO21 (promedio de 8 muestras) → porcentaje 1-100 |
 | `rtc_pcf8563.{h,cpp}` | Driver I2C del RTC hardware |
-| `display_client.{h,cpp}` | Cliente HTTP + validación estricta del formato EINK |
-| `eink_driver.{h,cpp}` | Driver UC8179 raw (init, LUTs, subida de bitplanes, refresh, sleep, pantalla de error) |
+| `display_client.{h,cpp}` | Cliente HTTP(S) + fingerprint pinning + validación estricta del formato EINK; reutilizado tal cual por la validación en vivo del portal |
+| `eink_driver.{h,cpp}` | Driver UC8179 raw (init, LUTs, subida de bitplanes, refresh, sleep, pantalla de error, pantalla de aprovisionamiento con QR) |
 | `time_scheduler.{h,cpp}` | Lógica pura de cálculo de próxima hora de despertar |
 
 ## Decisión de diseño: la batería se lee antes de tocar el WiFi
@@ -228,6 +462,23 @@ resetea en cualquier ciclo exitoso.
   `RTC_PCF8563.ino`, `LowPower_DeepSleep.ino` en
   `Seeed-Projects/OSHW-reTerminal-Series-E-D`), leídos directamente del
   repositorio, no de memoria.
+- El aprovisionamiento inalámbrico (SoftAP + QR + fingerprint TLS)
+  compila limpio para `reterminal_e1001` con la librería `ricmoo/QRCode`
+  añadida, y los tests de `time_scheduler` en `pio test -e native` siguen
+  pasando (10/10; hizo falta añadir `test_build_src = true` al `[env:native]`
+  de `platformio.ini`, una brecha de configuración preexistente sin
+  relación con esta feature — sin ese flag, `pio test` no enlazaba
+  `time_scheduler.cpp` con el binario de test). La firma real de
+  `WiFiClientSecure::verify()`/`verify_ssl_fingerprint()` del core
+  Arduino-ESP32 2.0.17 instalado se confirmó leyendo
+  `ssl_client.cpp`/`.h` directamente: acepta el fingerprint con o sin
+  `:` y espacios, así que `normalizeFingerprint()` no necesita
+  reintroducir separadores. También se confirmó leyendo
+  `HTTPClient.cpp` que `HTTPClient::connect()` reutiliza un `Client`
+  que ya está conectado en vez de reconectar, que es lo que permite
+  conectar+verificar el fingerprint manualmente antes de
+  `http.begin(secureClient, url)` sin un segundo handshake sin
+  verificar por medio.
 
 **Pendiente de verificar con el hardware real** (no se puede comprobar sin
 el dispositivo):
@@ -253,3 +504,34 @@ el dispositivo):
   esta unidad concreta y sea el botón que uno espera al mirar la carcasa —
   la polaridad (`ANY_LOW`) y el pull-up del dominio RTC vienen del ejemplo
   de Seeed, no verificados en este hardware todavía.
+- Que el móvil dispare de verdad el popup de "unirse a la red" con las
+  rutas de captive portal implementadas en `setup_portal.cpp` — el
+  comportamiento exacto varía por versión de iOS/Android/Windows y no es
+  100% predecible desde el código; como fallback siempre está la URL
+  `http://192.168.4.1/` mostrada en el panel.
+- Legibilidad real del QR de aprovisionamiento en el panel de 4 grises
+  (contraste, tamaño de módulo) — `QR_VERSION`/el tamaño de caja en
+  `eink_driver.cpp` están dimensionados con margen sobre el payload
+  esperado, pero no se ha escaneado un QR real desde este panel.
+- Que el polling de `/validate-status` (con el `AbortController` de 4s y
+  reintento cada ~1s) efectivamente absorba el salto de canal del AP en
+  `WIFI_AP_STA` sin que el usuario tenga que recargar manualmente la
+  página — el salto de canal en sí ya está confirmado que ocurre en
+  hardware real (ver "Hallazgo real" arriba); lo que falta por confirmar
+  es que la mitigación async lo haga imperceptible en la práctica y no
+  solo en el diseño.
+- Consumo real de batería con el SoftAP + `DNSServer` + `WebServer`
+  activos durante varios minutos, para calibrar
+  `PORTAL_INACTIVITY_TIMEOUT_MS`/`PORTAL_RETRY_SLEEP_SEC` con datos reales
+  en vez de una estimación.
+- Fiabilidad del gesto de reset de 10s con el pull-up normal
+  (`INPUT_PULLUP`) que se reconfigura nada más despertar, frente al
+  pull-up del dominio RTC usado durante el propio sueño.
+- Que `WiFiClientSecure::verify()` rechace de verdad un fingerprint
+  incorrecto (no solo que acepte uno correcto, ya confirmado en hardware
+  real tras el fix del `domain_name` descrito arriba) sin colgarse en el
+  handshake TLS.
+- Que `ESP.restart()` (usado tanto al guardar la config como al aplicar el
+  gesto de reset) preserve `RTC_DATA_ATTR g_state` en esta unidad concreta
+  — documentado así en ESP-IDF (solo un power-on/EN real lo resetea), no
+  confirmado empíricamente en este hardware todavía.

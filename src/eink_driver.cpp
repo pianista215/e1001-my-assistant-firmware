@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Arduino.h>
 #include <SPI.h>
+#include <qrcode.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -199,6 +200,36 @@ class Gray4Buffer : public Adafruit_GFX {
     }
 };
 
+// Renders `payload` as a QR code into `canvas`, sized to fit within
+// roughly `boxSizePx` while leaving a quiet zone (blank margin) around it
+// -- real-world scanners need that margin to lock onto the code reliably.
+void drawQrCode(Gray4Buffer& canvas, const char* payload, int16_t boxX, int16_t boxY,
+                 int16_t boxSizePx) {
+    QRCode qr;
+    uint8_t* qrBuf = static_cast<uint8_t*>(malloc(qrcode_getBufferSize(QR_VERSION)));
+    if (!qrBuf) return;
+    if (qrcode_initText(&qr, qrBuf, QR_VERSION, ECC_LOW, payload) != 0) {
+        free(qrBuf);
+        return;
+    }
+
+    const int totalModules = qr.size + 2 * QR_QUIET_ZONE_MODULES;
+    int scale = boxSizePx / totalModules;
+    if (scale < 1) scale = 1;
+    const int16_t originX = boxX + QR_QUIET_ZONE_MODULES * scale;
+    const int16_t originY = boxY + QR_QUIET_ZONE_MODULES * scale;
+
+    for (uint8_t y = 0; y < qr.size; y++) {
+        for (uint8_t x = 0; x < qr.size; x++) {
+            if (qrcode_getModule(&qr, x, y)) {
+                canvas.fillRect(originX + x * scale, originY + y * scale, scale, scale, 0);
+            }
+        }
+    }
+
+    free(qrBuf);
+}
+
 }  // namespace
 
 namespace eink {
@@ -247,6 +278,73 @@ void drawErrorScreen(const char* code, uint8_t consecutiveFailures) {
     canvas.setTextSize(2);
     canvas.setCursor(60, 260);
     canvas.print(line2);
+
+    if (initGrayMode()) {
+        uploadPlane(0x10, 0, canvas.buf, EPD_EXPECTED_WIDTH, EPD_EXPECTED_HEIGHT);
+        uploadPlane(0x13, 1, canvas.buf, EPD_EXPECTED_WIDTH, EPD_EXPECTED_HEIGHT);
+        writeCommand(0x12);
+        delay(100);
+        waitBusy();
+    }
+
+    free(canvas.buf);
+}
+
+void drawProvisioningScreen(const char* apSsid, const char* apPassword, const char* qrPayload,
+                             const char* fallbackUrl) {
+    Gray4Buffer canvas(EPD_EXPECTED_WIDTH, EPD_EXPECTED_HEIGHT);
+    const uint32_t bufSize = static_cast<uint32_t>(EPD_EXPECTED_WIDTH) * EPD_EXPECTED_HEIGHT / 4;
+    canvas.buf = static_cast<uint8_t*>(malloc(bufSize));
+    if (!canvas.buf) return;
+    memset(canvas.buf, 0xFF, bufSize);  // 0b11 = 3 = white
+
+    constexpr int16_t kQrBoxX = 40;
+    constexpr int16_t kQrBoxY = 70;
+    constexpr int16_t kQrBoxSize = 320;
+    drawQrCode(canvas, qrPayload, kQrBoxX, kQrBoxY, kQrBoxSize);
+
+    const int16_t textX = kQrBoxX + kQrBoxSize + 40;
+    int16_t y = 70;
+    canvas.setTextColor(0);  // black
+
+    canvas.setTextSize(3);
+    canvas.setCursor(textX, y);
+    canvas.print("Configura el");
+    y += 36;
+    canvas.setCursor(textX, y);
+    canvas.print("dispositivo");
+    y += 60;
+
+    canvas.setTextSize(2);
+    canvas.setCursor(textX, y);
+    canvas.print("1. Escanea el QR para");
+    y += 26;
+    canvas.setCursor(textX, y);
+    canvas.print("unirte a esta red WiFi.");
+    y += 50;
+
+    canvas.setCursor(textX, y);
+    canvas.print("Si no conecta solo:");
+    y += 32;
+    canvas.setCursor(textX, y);
+    canvas.print("Red:");
+    canvas.setCursor(textX + 90, y);
+    canvas.print(apSsid);
+    y += 30;
+    canvas.setCursor(textX, y);
+    canvas.print("Clave:");
+    canvas.setCursor(textX + 90, y);
+    canvas.print(apPassword);
+    y += 50;
+
+    canvas.setCursor(textX, y);
+    canvas.print("2. Si no se abre solo,");
+    y += 26;
+    canvas.setCursor(textX, y);
+    canvas.print("visita:");
+    y += 30;
+    canvas.setCursor(textX, y);
+    canvas.print(fallbackUrl);
 
     if (initGrayMode()) {
         uploadPlane(0x10, 0, canvas.buf, EPD_EXPECTED_WIDTH, EPD_EXPECTED_HEIGHT);

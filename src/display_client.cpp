@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <Stream.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
 
 #include <cstring>
@@ -66,6 +67,53 @@ class MemoryStream : public Stream {
     bool _overflowed = false;
 };
 
+struct UrlParts {
+    bool isHttps = false;
+    String host;
+    uint16_t port = 0;
+};
+
+// Parses "http(s)://host[:port]" (no path -- API_BASE_URL's convention,
+// same one the setup portal enforces before ever reaching here).
+bool splitUrl(const String& baseUrl, UrlParts& out) {
+    String rest;
+    if (baseUrl.startsWith("https://")) {
+        out.isHttps = true;
+        rest = baseUrl.substring(8);
+    } else if (baseUrl.startsWith("http://")) {
+        out.isHttps = false;
+        rest = baseUrl.substring(7);
+    } else {
+        return false;
+    }
+    if (rest.length() == 0) return false;
+
+    const int colonIdx = rest.indexOf(':');
+    if (colonIdx >= 0) {
+        out.host = rest.substring(0, colonIdx);
+        const String portStr = rest.substring(colonIdx + 1);
+        if (portStr.length() == 0) return false;
+        const long portVal = portStr.toInt();
+        if (portVal <= 0 || portVal > 65535) return false;
+        out.port = static_cast<uint16_t>(portVal);
+    } else {
+        out.host = rest;
+        out.port = out.isHttps ? 443 : 80;
+    }
+    return out.host.length() > 0;
+}
+
+String fingerprintToHex(const uint8_t sha256[32]) {
+    static const char kHexDigits[] = "0123456789ABCDEF";
+    String out;
+    out.reserve(64);
+    for (int i = 0; i < 32; i++) {
+        out += kHexDigits[sha256[i] >> 4];
+        out += kHexDigits[sha256[i] & 0x0F];
+    }
+    return out;
+}
+
 }  // namespace
 
 const char* toString(DisplayFetchError err) {
@@ -74,6 +122,9 @@ const char* toString(DisplayFetchError err) {
         case DisplayFetchError::HttpConnectFailed: return "HTTP_CONN";
         case DisplayFetchError::HttpTimeout: return "HTTP_TIMEOUT";
         case DisplayFetchError::HttpStatus: return "HTTP_STATUS";
+        case DisplayFetchError::HttpUnauthorized: return "HTTP_401";
+        case DisplayFetchError::TlsConnectFailed: return "TLS_CONN";
+        case DisplayFetchError::TlsFingerprintMismatch: return "TLS_FINGERPRINT";
         case DisplayFetchError::ResponseTooLarge: return "TOO_LARGE";
         case DisplayFetchError::TooShort: return "TOO_SHORT";
         case DisplayFetchError::BadMagic: return "BAD_MAGIC";
@@ -94,26 +145,83 @@ void DisplayFetchResult::free() {
     }
 }
 
-DisplayFetchResult fetchDisplayBuffer(int batteryPercent) {
+DisplayFetchResult fetchDisplayBuffer(const DisplayEndpointConfig& cfg, int batteryPercent) {
     DisplayFetchResult result;
 
-    const String url =
-        String(API_BASE_URL) + "/api/v1/display?battery=" + String(batteryPercent);
+    UrlParts parts;
+    if (!splitUrl(cfg.baseUrl, parts)) {
+        result.error = DisplayFetchError::HttpConnectFailed;
+        return result;
+    }
+
+    const String url = cfg.baseUrl + "/api/v1/display?battery=" + String(batteryPercent);
 
     HTTPClient http;
     http.setConnectTimeout(HTTP_TIMEOUT_MS);
     http.setTimeout(HTTP_TIMEOUT_MS);
-    if (!http.begin(url)) {
+
+    // Connect (and, for https, verify the pinned fingerprint) BEFORE
+    // http.begin(): HTTPClient::connect() reuses an already-connected
+    // client as-is (see HTTPClient.cpp), so this is the only handshake
+    // that happens -- no separate unverified connection attempt.
+    WiFiClientSecure secureClient;
+    bool began = false;
+    if (parts.isHttps) {
+        secureClient.setInsecure();  // no CA chain -- fingerprint pinning replaces it
+        // WiFiClientSecure::setTimeout() takes SECONDS, not ms (unlike
+        // HTTPClient::setTimeout(), which converts internally) -- passing
+        // the ms constant directly here used to mean an ~8000-SECOND
+        // socket timeout instead of 8, so an unreachable host/port would
+        // hang for over 2 hours instead of failing in HTTP_TIMEOUT_MS as
+        // documented. setHandshakeTimeout() has the same seconds unit and
+        // its own 120s default, which needed bounding too.
+        secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+        secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
+        if (!secureClient.connect(parts.host.c_str(), parts.port)) {
+            result.error = DisplayFetchError::TlsConnectFailed;
+            return result;
+        }
+        // Passing nullptr (not parts.host) skips this core's post-fingerprint
+        // hostname/IP check: verify_ssl_dn() in ssl_client.cpp compares SAN
+        // entries as raw bytes without checking their ASN.1 type, so an
+        // iPAddress SAN (what a cert generated for a LAN IP -- exactly
+        // my-assistant's --https self-signed cert -- gets) is 4 binary
+        // octets, never equal to the literal dotted-decimal string we'd
+        // pass as domain_name. That check would then *always* fail for an
+        // IP-based endpoint even with a byte-perfect fingerprint match
+        // (confirmed against real hardware/backend). Fingerprint pinning
+        // already authenticates the exact certificate, which is strictly
+        // stronger than a name/IP check, so skipping it here is correct,
+        // not just a workaround.
+        if (!secureClient.verify(cfg.fingerprintHex.c_str(), nullptr)) {
+            uint8_t actual[32];
+            if (secureClient.getFingerprintSHA256(actual)) {
+                result.actualFingerprintHex = fingerprintToHex(actual);
+            }
+            secureClient.stop();
+            result.error = DisplayFetchError::TlsFingerprintMismatch;
+            return result;
+        }
+        began = http.begin(secureClient, url);
+    } else {
+        began = http.begin(url);
+    }
+    if (!began) {
         result.error = DisplayFetchError::HttpConnectFailed;
         return result;
     }
-    http.addHeader("Authorization", String("Bearer ") + API_AUTH_TOKEN);
+    http.addHeader("Authorization", String("Bearer ") + cfg.authToken);
 
     const int status = http.GET();
     result.httpStatus = status;
     if (status <= 0) {
         http.end();
         result.error = DisplayFetchError::HttpTimeout;
+        return result;
+    }
+    if (status == HTTP_CODE_UNAUTHORIZED) {
+        http.end();
+        result.error = DisplayFetchError::HttpUnauthorized;
         return result;
     }
     if (status != HTTP_CODE_OK) {
@@ -191,5 +299,38 @@ DisplayFetchResult fetchDisplayBuffer(int batteryPercent) {
     result.pixels = buf + kHeaderLen;
     result.width = width;
     result.height = height;
+    return result;
+}
+
+TlsFingerprintProbeResult probeTlsFingerprintInsecure(const String& baseUrl) {
+    TlsFingerprintProbeResult result;
+
+    UrlParts parts;
+    if (!splitUrl(baseUrl, parts) || !parts.isHttps) {
+        result.error = TlsFingerprintProbeError::UrlNotHttps;
+        return result;
+    }
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // deliberate: TOFU probe, no verification at all
+    // See the matching comment in fetchDisplayBuffer(): both timeouts here
+    // are in SECONDS, not ms.
+    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
+    if (!secureClient.connect(parts.host.c_str(), parts.port)) {
+        result.error = TlsFingerprintProbeError::ConnectFailed;
+        return result;
+    }
+
+    uint8_t actual[32];
+    if (!secureClient.getFingerprintSHA256(actual)) {
+        secureClient.stop();
+        result.error = TlsFingerprintProbeError::FingerprintUnavailable;
+        return result;
+    }
+
+    secureClient.stop();
+    result.error = TlsFingerprintProbeError::None;
+    result.fingerprintHex = fingerprintToHex(actual);
     return result;
 }

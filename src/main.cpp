@@ -3,16 +3,17 @@
 #include <esp_attr.h>
 #include <esp_sleep.h>
 
-#include "driver/rtc_io.h"
-
 #include <ctime>
 #include <sys/time.h>
 
 #include "battery.h"
 #include "config.h"
+#include "device_config.h"
 #include "display_client.h"
 #include "eink_driver.h"
 #include "rtc_pcf8563.h"
+#include "setup_portal.h"
+#include "sleep_control.h"
 #include "sleep_state.h"
 #include "time_scheduler.h"
 #include "wifi_manager.h"
@@ -33,21 +34,19 @@ const char* wakeupCauseString(esp_sleep_wakeup_cause_t cause) {
     }
 }
 
-// Every sleep path (success, backoff, first-boot retry) goes through here,
-// so the wake button always works regardless of why the device is
-// sleeping -- e.g. forcing an immediate retry after fixing WiFi/API config
-// instead of waiting out a backoff.
-void goToSleep(uint32_t seconds) {
-    Serial1.printf("[MAIN] Sleeping for %lu s (or until the wake button is pressed)\n",
-                    static_cast<unsigned long>(seconds));
-    Serial1.flush();
-    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
-    esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKE_BUTTON, ESP_EXT1_WAKEUP_ANY_LOW);
-    // Normal GPIO pull-up is off during deep sleep; the RTC (keep-alive)
-    // domain needs its own pull-up enabled instead.
-    rtc_gpio_pullup_en(static_cast<gpio_num_t>(PIN_WAKE_BUTTON));
-    rtc_gpio_pulldown_dis(static_cast<gpio_num_t>(PIN_WAKE_BUTTON));
-    esp_deep_sleep_start();
+// Polls the wake button for up to `holdMs`. Returns true if it's still
+// held down the whole time (reset gesture), false if released early
+// (ordinary manual-refresh press). Deliberately blocks before doing
+// anything else on an EXT1 wake -- the button must not trigger a refresh
+// the instant it's pressed, or a long hold could never be told apart from
+// a quick one.
+bool buttonHeldFor(unsigned long holdMs) {
+    const unsigned long start = millis();
+    while (millis() - start < holdMs) {
+        if (digitalRead(PIN_WAKE_BUTTON) == HIGH) return false;  // released early
+        delay(RESET_HOLD_POLL_MS);
+    }
+    return true;
 }
 
 uint32_t backoffSeconds(uint8_t failures) {
@@ -73,7 +72,7 @@ uint32_t backoffSeconds(uint8_t failures) {
 
     wifiDisconnect();
     goToSleep(backoffSeconds(g_state.consecutiveFailures));
-    while (true) delay(1000);  // unreachable; esp_deep_sleep_start() never returns
+    while (true) delay(1000);  // unreachable; goToSleep() never returns
 }
 
 }  // namespace
@@ -81,7 +80,34 @@ uint32_t backoffSeconds(uint8_t failures) {
 void setup() {
     Serial1.begin(SERIAL_BAUD, SERIAL_8N1, PIN_SERIAL_RX, PIN_SERIAL_TX);
     delay(100);
-    Serial1.printf("[MAIN] Wake cause: %s\n", wakeupCauseString(esp_sleep_get_wakeup_cause()));
+    const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    Serial1.printf("[MAIN] Wake cause: %s\n", wakeupCauseString(wakeCause));
+
+    // Normal GPIO pull-up is what was active during deep sleep (see
+    // sleep_control.cpp); re-establish it as a plain digital input now
+    // that we're awake, so digitalRead() below reads reliably.
+    pinMode(PIN_WAKE_BUTTON, INPUT_PULLUP);
+
+    // Reset-to-setup gesture: holding the wake button for RESET_HOLD_MS
+    // wipes the saved config and re-enters the setup portal. Only checked
+    // when already configured -- an unconfigured device is heading into
+    // the portal anyway, no need to disambiguate the press. A short press
+    // falls through to the ordinary manual-refresh cycle below, unchanged.
+    if (wakeCause == ESP_SLEEP_WAKEUP_EXT1 && device_config::isConfigured()) {
+        if (buttonHeldFor(RESET_HOLD_MS)) {
+            Serial1.println("[MAIN] Wake button held -- clearing config, entering setup portal.");
+            device_config::clear();
+            ESP.restart();
+        }
+        Serial1.println("[MAIN] Wake button released early -- manual refresh cycle.");
+    }
+
+    if (!device_config::isConfigured()) {
+        setup_portal::run();
+    }
+
+    DeviceConfig cfg;
+    device_config::load(cfg);
 
     // Must happen before any mktime()/localtime_r() call (including inside
     // rtc_pcf8563.cpp), since those interpret struct tm as local time in
@@ -105,7 +131,8 @@ void setup() {
     const int batteryPct = readBatteryPercent();
     Serial1.printf("[MAIN] Battery: %d%%\n", batteryPct);
 
-    wifiBeginConnect(g_state.wifi);
+    WiFi.mode(WIFI_STA);
+    wifiBeginConnect(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str(), g_state.wifi);
     const bool wifiOk =
         wifiWaitConnected(g_state.wifi, WIFI_FAST_RECONNECT_TIMEOUT_MS, WIFI_FULL_CONNECT_TIMEOUT_MS);
     if (!wifiOk) {
@@ -143,10 +170,18 @@ void setup() {
         return;
     }
 
-    DisplayFetchResult fetch = fetchDisplayBuffer(batteryPct);
+    const DisplayEndpointConfig endpoint{cfg.apiBaseUrl, cfg.apiAuthToken, cfg.tlsFingerprint};
+    DisplayFetchResult fetch = fetchDisplayBuffer(endpoint, batteryPct);
     if (!fetch.ok()) {
         Serial1.printf("[MAIN] Display fetch failed: %s (http=%d)\n", toString(fetch.error),
                         fetch.httpStatus);
+        if (fetch.error == DisplayFetchError::TlsFingerprintMismatch) {
+            Serial1.printf("[MAIN] Expected fingerprint: %s\n", cfg.tlsFingerprint.c_str());
+            Serial1.printf("[MAIN] Server presented:     %s\n",
+                            fetch.actualFingerprintHex.length() > 0
+                                ? fetch.actualFingerprintHex.c_str()
+                                : "(couldn't read peer cert)");
+        }
         handleFailure(toString(fetch.error));
     }
 
