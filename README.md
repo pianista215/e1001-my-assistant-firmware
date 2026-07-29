@@ -10,7 +10,7 @@ Firmware for the [Seeed reTerminal E1001](https://www.seeedstudio.com/reTerminal
 
 The very first time it boots (or after a manual reset gesture), it doesn't have any WiFi/endpoint configuration yet — instead it opens its own WiFi hotspot and shows a QR code + instructions on the e-ink panel so you can configure it from your phone. See [Section 3](#3-first-boot-setup-wifi--endpoint-portal) below.
 
-See [`CLAUDE.md`](CLAUDE.md) (in Spanish) for the internal architecture, design decisions, and what's still pending verification on real hardware.
+See [`CLAUDE.md`](CLAUDE.md) for the internal architecture, design decisions, and what's still pending verification on real hardware.
 
 ## What you need
 
@@ -49,7 +49,7 @@ Device-specific configuration (WiFi credentials, the `my-assistant` endpoint URL
 
 1. On first boot (or after the reset gesture below), the device opens its own WiFi hotspot (SSID like `E1001-Setup-XXXXXX`, WPA2-protected with a password unique to that device) and shows a QR code plus fallback text on the e-ink panel.
 2. Scan the QR with your phone's camera app to join that hotspot directly (no typing required); if your phone doesn't auto-prompt to open a page, the panel also shows a fallback URL (`http://192.168.4.1/`) and the AP SSID/password as plain text.
-3. Fill in the form: your real WiFi SSID/password, the `my-assistant` base URL (`http://...` or `https://...`, no trailing slash), and the auth token. There's no fingerprint field — for HTTPS endpoints the device fetches the certificate itself in the next step.
+3. Fill in the form: pick English or Español from the language selector (switching it reloads the page in that language before you type anything — it also decides the language of the e-ink panel's error screen later on), then enter your real WiFi SSID/password, the `my-assistant` base URL (`http://...` or `https://...`, no trailing slash), and the auth token. There's no fingerprint field — for HTTPS endpoints the device fetches the certificate itself in the next step.
 4. On submit, the device connects to the WiFi you entered. For an `https://` endpoint, it then connects to the server and shows you the certificate's SHA-256 fingerprint on the phone screen, asking you to confirm it (trust-on-first-use) before pinning it — confirm if it looks right (it always will unless you've set up a man-in-the-middle on purpose), or reject to go back and fix the URL if it looks wrong. Once a fingerprint is confirmed (or immediately, for `http://`), it makes a real request to the endpoint with the token — if anything's wrong (bad WiFi password, wrong URL, wrong token), the form tells you exactly what failed and lets you fix it without losing the hotspot. There's no "save anyway" bypass: the config is only ever persisted after a real, live validation succeeds.
 5. Once validation passes, the config is stored on the device (in flash, survives power loss) and it reboots straight into the normal hourly cycle.
 

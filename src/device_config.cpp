@@ -10,6 +10,7 @@ constexpr const char* kKeyPass = "pass";
 constexpr const char* kKeyUrl = "url";
 constexpr const char* kKeyToken = "token";
 constexpr const char* kKeyFingerprint = "fp";
+constexpr const char* kKeyLang = "lang";
 constexpr const char* kKeyDone = "done";
 }  // namespace
 
@@ -35,6 +36,7 @@ bool load(DeviceConfig& out) {
     out.apiBaseUrl = prefs.getString(kKeyUrl, "");
     out.apiAuthToken = prefs.getString(kKeyToken, "");
     out.tlsFingerprint = prefs.getString(kKeyFingerprint, "");
+    out.language = prefs.getString(kKeyLang, "en");
     prefs.end();
     return true;
 }
@@ -47,6 +49,7 @@ void save(const DeviceConfig& cfg) {
     prefs.putString(kKeyUrl, cfg.apiBaseUrl);
     prefs.putString(kKeyToken, cfg.apiAuthToken);
     prefs.putString(kKeyFingerprint, cfg.tlsFingerprint);
+    prefs.putString(kKeyLang, cfg.language);
     prefs.putBool(kKeyDone, true);  // last: marks the config as complete/valid
     prefs.end();
 }
