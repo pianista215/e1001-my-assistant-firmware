@@ -11,6 +11,7 @@
 #include "device_config.h"
 #include "display_client.h"
 #include "eink_driver.h"
+#include "i18n.h"
 #include "rtc_pcf8563.h"
 #include "setup_portal.h"
 #include "sleep_control.h"
@@ -60,13 +61,13 @@ uint32_t backoffSeconds(uint8_t failures) {
 // retrying next cycle, with capped backoff. Only draws an error screen
 // after several consecutive failures, so a transient blip doesn't cost an
 // e-paper refresh.
-[[noreturn]] void handleFailure(const char* code) {
+[[noreturn]] void handleFailure(const char* code, Lang lang) {
     if (g_state.consecutiveFailures < 255) g_state.consecutiveFailures++;
     Serial1.printf("[MAIN] Failure: %s (consecutive=%u)\n", code, g_state.consecutiveFailures);
 
     if (g_state.consecutiveFailures >= ERROR_SCREEN_AFTER_N_FAILURES) {
         eink::init();
-        eink::drawErrorScreen(code, g_state.consecutiveFailures);
+        eink::drawErrorScreen(code, g_state.consecutiveFailures, lang);
         eink::sleep();
     }
 
@@ -136,7 +137,7 @@ void setup() {
     const bool wifiOk =
         wifiWaitConnected(g_state.wifi, WIFI_FAST_RECONNECT_TIMEOUT_MS, WIFI_FULL_CONNECT_TIMEOUT_MS);
     if (!wifiOk) {
-        handleFailure("WIFI");
+        handleFailure("WIFI", i18n::langFromCode(cfg.language));
     }
     Serial1.println("[MAIN] WiFi connected.");
 
@@ -182,7 +183,7 @@ void setup() {
                                 ? fetch.actualFingerprintHex.c_str()
                                 : "(couldn't read peer cert)");
         }
-        handleFailure(toString(fetch.error));
+        handleFailure(toString(fetch.error), i18n::langFromCode(cfg.language));
     }
 
     eink::init();
@@ -191,7 +192,7 @@ void setup() {
     fetch.free();
 
     if (!drawOk) {
-        handleFailure("PANEL");
+        handleFailure("PANEL", i18n::langFromCode(cfg.language));
     }
 
     Serial1.println("[MAIN] Cycle OK.");

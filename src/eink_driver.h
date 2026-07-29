@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 
+#include "i18n.h"
+
 // Raw UC8179 driver for the E1001's 7.5" 800x480 4-level-gray panel, ported
 // from Seeed's own confirmed-working example (see CLAUDE.md for the exact
 // source). Deliberately does NOT depend on GxEPD2 or Seeed_GFX: the
@@ -31,7 +33,7 @@ void sleep();
 // minimal built-in font, for the rare case of repeated fetch/decode
 // failures. Costs one extra panel refresh, so callers should only invoke
 // this after several consecutive failures, not on the first blip.
-void drawErrorScreen(const char* code, uint8_t consecutiveFailures);
+void drawErrorScreen(const char* code, uint8_t consecutiveFailures, Lang lang);
 
 // Renders the first-boot / reset provisioning screen: a scannable
 // "WIFI:T:WPA;S:...;P:...;;" QR code (see setup_portal.h) that lets a

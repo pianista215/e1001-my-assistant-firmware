@@ -15,6 +15,7 @@ struct DeviceConfig {
     String apiBaseUrl;      // "http://host[:port]" or "https://host[:port]", no trailing slash
     String apiAuthToken;
     String tlsFingerprint;  // 64 uppercase hex chars, no ":"; empty when apiBaseUrl is http://
+    String language;        // "en" or "es" -- see i18n.h. Empty/unrecognized -> Lang::EN.
 };
 
 namespace device_config {

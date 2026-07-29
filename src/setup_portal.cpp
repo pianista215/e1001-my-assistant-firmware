@@ -11,6 +11,7 @@
 #include "device_config.h"
 #include "display_client.h"
 #include "eink_driver.h"
+#include "i18n.h"
 #include "sleep_control.h"
 #include "wifi_manager.h"
 
@@ -114,50 +115,6 @@ String buildWifiQrPayload(const String& ssid, const String& password) {
     return "WIFI:T:WPA;S:" + escapeQrField(ssid) + ";P:" + escapeQrField(password) + ";;";
 }
 
-// Translates a fetchDisplayBuffer() failure into a message a non-technical
-// user can act on, so the setup form points at the specific field to fix
-// instead of a raw error code.
-String explainFetchError(const DisplayFetchResult& fetch) {
-    switch (fetch.error) {
-        case DisplayFetchError::None:
-            return "OK";
-        case DisplayFetchError::HttpConnectFailed:
-            return "No se pudo contactar con el endpoint (revisa la URL y el puerto).";
-        case DisplayFetchError::HttpTimeout:
-            return "El endpoint no respondió a tiempo.";
-        case DisplayFetchError::HttpUnauthorized:
-            return "El servidor rechazó el token (401). Revisa el token.";
-        case DisplayFetchError::TlsConnectFailed:
-            return "No se pudo establecer una conexión TLS con el servidor.";
-        case DisplayFetchError::TlsFingerprintMismatch: {
-            String msg = "El fingerprint no coincide con el certificado real del servidor.";
-            if (fetch.actualFingerprintHex.length() > 0) {
-                msg += " El servidor presentó: " + fetch.actualFingerprintHex +
-                       ". Cópialo de nuevo desde /api/v1/tls-cert.";
-            }
-            return msg;
-        }
-        case DisplayFetchError::HttpStatus: {
-            char buf[72];
-            snprintf(buf, sizeof(buf), "El servidor respondió con un error inesperado (HTTP %d).",
-                      fetch.httpStatus);
-            return String(buf);
-        }
-        case DisplayFetchError::BadMagic:
-        case DisplayFetchError::UnsupportedVersion:
-        case DisplayFetchError::UnsupportedBpp:
-        case DisplayFetchError::UnexpectedDimensions:
-        case DisplayFetchError::TooShort:
-        case DisplayFetchError::PayloadTooShort:
-            return "El servidor respondió, pero con un formato inesperado; revisa que la URL "
-                   "apunte a este mismo backend.";
-        case DisplayFetchError::ResponseTooLarge:
-        case DisplayFetchError::OutOfMemory:
-            return "Fallo interno del dispositivo, vuelve a intentarlo.";
-    }
-    return "Error desconocido.";
-}
-
 // Runs on a background FreeRTOS task so the WebServer/DNSServer loop in
 // setup_portal::run() never blocks on WiFi/HTTPS timeouts (up to ~23s
 // combined) -- see CLAUDE.md for why that mattered on real hardware.
@@ -175,6 +132,8 @@ const char* probeErrorToString(TlsFingerprintProbeError err) {
 
 void validationTask(void* param) {
     DeviceConfig* candidate = static_cast<DeviceConfig*>(param);
+    const Lang lang = i18n::langFromCode(candidate->language);
+    const i18n::PortalStrings& ps = i18n::portal(lang);
 
     Serial1.printf("[PORTAL] Validating: ssid='%s' url='%s'\n", candidate->wifiSsid.c_str(),
                     candidate->apiBaseUrl.c_str());
@@ -186,9 +145,7 @@ void validationTask(void* param) {
     if (!wifiOk) {
         Serial1.println("[PORTAL] Validation failed: WiFi did not connect.");
         WiFi.disconnect(false);  // drop the STA attempt only, keep the AP alive
-        setValidationProgress(ValidationStage::Failed,
-                               "No se pudo conectar a esa wifi (SSID/contraseña incorrectos o "
-                               "fuera de alcance).");
+        setValidationProgress(ValidationStage::Failed, ps.wifiFailedMsg);
         delete candidate;
         vTaskDelete(nullptr);
         return;  // unreachable; vTaskDelete(nullptr) never returns
@@ -202,8 +159,7 @@ void validationTask(void* param) {
         // pin it if they confirm. probeTlsFingerprintInsecure() is
         // strictly TOFU-only -- the real pinned check happens below via
         // fetchDisplayBuffer() once a fingerprint has been confirmed.
-        setValidationProgress(ValidationStage::FetchingCertificate,
-                               "Conectado a la wifi. Obteniendo el certificado del servidor...");
+        setValidationProgress(ValidationStage::FetchingCertificate, ps.fetchingCertMsg);
         Serial1.printf("[PORTAL] Probing TLS certificate at %s ...\n", candidate->apiBaseUrl.c_str());
         const unsigned long probeStart = millis();
         const TlsFingerprintProbeResult probe = probeTlsFingerprintInsecure(candidate->apiBaseUrl);
@@ -212,17 +168,16 @@ void validationTask(void* param) {
                         static_cast<unsigned long>(millis() - probeStart));
         if (probe.error != TlsFingerprintProbeError::None) {
             WiFi.disconnect(false);
-            String msg = "No se pudo obtener el certificado TLS del servidor";
+            String msg = ps.certProbeFailedPrefix;
             switch (probe.error) {
                 case TlsFingerprintProbeError::ConnectFailed:
-                    msg += " (no respondió la conexión TLS -- revisa la URL, el puerto y que esté "
-                           "encendido).";
+                    msg += ps.certProbeConnectFailedSuffix;
                     break;
                 case TlsFingerprintProbeError::FingerprintUnavailable:
-                    msg += " (conectó pero no se pudo leer el certificado del servidor).";
+                    msg += ps.certProbeNoPeerCertSuffix;
                     break;
                 default:
-                    msg += " (revisa que la URL empiece por https://).";
+                    msg += ps.certProbeNotHttpsSuffix;
                     break;
             }
             setValidationProgress(ValidationStage::Failed, msg);
@@ -236,8 +191,7 @@ void validationTask(void* param) {
         g_validationState.stage = ValidationStage::AwaitingFingerprintConfirmation;
         g_validationState.pendingFingerprint = probe.fingerprintHex;
         g_validationState.decision = FingerprintDecision::Pending;
-        g_validationState.message =
-            "El certificado del servidor es autofirmado. Confirma que el fingerprint es correcto.";
+        g_validationState.message = ps.awaitingFingerprintMsg;
         portEXIT_CRITICAL(&g_validationMux);
 
         const unsigned long waitStart = millis();
@@ -254,8 +208,7 @@ void validationTask(void* param) {
         if (decision == FingerprintDecision::Pending) {
             Serial1.println("[PORTAL] Fingerprint confirmation timed out.");
             WiFi.disconnect(false);
-            setValidationProgress(ValidationStage::Failed,
-                                   "No se confirmó el fingerprint a tiempo. Vuelve a intentarlo.");
+            setValidationProgress(ValidationStage::Failed, ps.fingerprintTimeoutMsg);
             delete candidate;
             vTaskDelete(nullptr);
             return;  // unreachable; vTaskDelete(nullptr) never returns
@@ -263,9 +216,7 @@ void validationTask(void* param) {
         if (decision == FingerprintDecision::Rejected) {
             Serial1.println("[PORTAL] Fingerprint rejected by user.");
             WiFi.disconnect(false);
-            setValidationProgress(ValidationStage::Failed,
-                                   "Fingerprint rechazado. Revisa que la URL apunte al servidor "
-                                   "correcto e inténtalo de nuevo.");
+            setValidationProgress(ValidationStage::Failed, ps.fingerprintRejectedMsg);
             delete candidate;
             vTaskDelete(nullptr);
             return;  // unreachable; vTaskDelete(nullptr) never returns
@@ -275,7 +226,7 @@ void validationTask(void* param) {
         candidate->tlsFingerprint = probe.fingerprintHex;  // Confirmed
     }
 
-    setValidationProgress(ValidationStage::TestingEndpoint, "Conectado a la wifi. Probando el servidor...");
+    setValidationProgress(ValidationStage::TestingEndpoint, ps.testingEndpointMsg);
 
     // Same fetchDisplayBuffer() the normal hourly cycle uses -- one HTTP
     // client code path, exercised for real here. For https this re-does
@@ -287,7 +238,7 @@ void validationTask(void* param) {
     const bool fetchOk = fetch.ok();
     Serial1.printf("[PORTAL] Endpoint test result: %s (http=%d)\n", toString(fetch.error),
                     fetch.httpStatus);
-    const String errorMessage = fetchOk ? String() : explainFetchError(fetch);
+    const String errorMessage = fetchOk ? String() : i18n::explainFetchError(lang, fetch);
     fetch.free();
     WiFi.disconnect(false);
 
@@ -299,7 +250,7 @@ void validationTask(void* param) {
     }
 
     Serial1.println("[PORTAL] Validation OK, saving config.");
-    setValidationProgress(ValidationStage::Success, "Configuración verificada. Guardando y reiniciando...");
+    setValidationProgress(ValidationStage::Success, ps.successMsg);
     device_config::save(*candidate);
     delete candidate;
 
@@ -326,7 +277,8 @@ void tryStartValidation(const DeviceConfig& candidate) {
     if (!alreadyRunning) {
         g_validationState = ValidationState{};
         g_validationState.stage = ValidationStage::ConnectingWifi;
-        g_validationState.message = "Conectando a la red wifi...";
+        g_validationState.message =
+            i18n::portal(i18n::langFromCode(candidate.language)).connectingWifiMsg;
         g_validationState.candidate = candidate;
     }
     portEXIT_CRITICAL(&g_validationMux);
@@ -338,9 +290,9 @@ void tryStartValidation(const DeviceConfig& candidate) {
                                             VALIDATION_TASK_PRIORITY, nullptr);
     if (created != pdPASS) {
         delete taskArg;
-        setValidationProgress(ValidationStage::Failed,
-                               "No se pudo iniciar la validación (memoria insuficiente). Vuelve a "
-                               "intentarlo.");
+        setValidationProgress(
+            ValidationStage::Failed,
+            i18n::portal(i18n::langFromCode(candidate.language)).taskStartFailedMsg);
     }
 }
 
@@ -360,21 +312,25 @@ String htmlEscape(const String& in) {
 }
 
 String renderFormPage(const DeviceConfig& values, const String& message, bool isError) {
+    const Lang lang = i18n::langFromCode(values.language);
+    const i18n::PortalStrings& ps = i18n::portal(lang);
+
     String html;
-    html.reserve(2200);
+    html.reserve(2400);
     html +=
-        "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+        "<!DOCTYPE html><html lang=\"" + String(i18n::langCode(lang)) +
+        "\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>Configura el dispositivo</title><style>"
+        "<title>" + String(ps.deviceTitle) + "</title><style>"
         "body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;}"
         "label{display:block;margin-top:14px;font-weight:600;}"
-        "input{width:100%;padding:8px;font-size:16px;box-sizing:border-box;}"
+        "input,select{width:100%;padding:8px;font-size:16px;box-sizing:border-box;}"
         ".msg{padding:10px;border-radius:6px;margin-bottom:12px;}"
         ".err{background:#fdecea;color:#611a15;}"
         ".ok{background:#e6f4ea;color:#1e4620;}"
         ".hint{color:#666;font-size:13px;margin-top:4px;}"
         "button{margin-top:20px;padding:10px 16px;font-size:16px;}"
-        "</style></head><body><h2>Configura el dispositivo</h2>";
+        "</style></head><body><h2>" + String(ps.deviceTitle) + "</h2>";
 
     if (message.length() > 0) {
         html += "<div class=\"msg ";
@@ -383,18 +339,25 @@ String renderFormPage(const DeviceConfig& values, const String& message, bool is
     }
 
     html += "<form method=\"POST\" action=\"/save\">";
-    html += "<label>Red WiFi (SSID)</label><input name=\"ssid\" value=\"" +
+    html += "<label>" + String(ps.labelLanguage) +
+            "</label><select name=\"lang\" onchange=\"location.search='?lang='+this.value\">";
+    html += String("<option value=\"en\"") + (lang == Lang::EN ? " selected" : "") +
+            ">English</option>";
+    html += String("<option value=\"es\"") + (lang == Lang::ES ? " selected" : "") +
+            ">Español</option>";
+    html += "</select>";
+    html += "<label>" + String(ps.labelSsid) + "</label><input name=\"ssid\" value=\"" +
             htmlEscape(values.wifiSsid) + "\" required>";
-    html += "<label>Contraseña WiFi</label><input type=\"password\" name=\"pass\" value=\"" +
+    html += "<label>" + String(ps.labelPass) +
+            "</label><input type=\"password\" name=\"pass\" value=\"" +
             htmlEscape(values.wifiPassword) + "\">";
-    html += "<label>URL del endpoint</label><input name=\"url\" value=\"" +
+    html += "<label>" + String(ps.labelUrl) + "</label><input name=\"url\" value=\"" +
             htmlEscape(values.apiBaseUrl) +
-            "\" placeholder=\"https://mi-servidor:8443\" required>";
-    html += "<label>Token</label><input name=\"token\" value=\"" +
+            "\" placeholder=\"https://my-server:8443\" required>";
+    html += "<label>" + String(ps.labelToken) + "</label><input name=\"token\" value=\"" +
             htmlEscape(values.apiAuthToken) + "\" required>";
-    html += "<div class=\"hint\">Si la URL es https, el dispositivo obtendrá el certificado del "
-            "servidor y te pedirá que confirmes su fingerprint durante la verificación.</div>";
-    html += "<button type=\"submit\">Guardar y verificar</button>";
+    html += "<div class=\"hint\">" + String(ps.httpsHint) + "</div>";
+    html += "<button type=\"submit\">" + String(ps.saveButton) + "</button>";
     html += "</form></body></html>";
     return html;
 }
@@ -447,10 +410,12 @@ String jsonEscape(const String& in) {
 // timeout by default, and an unresolved (not immediately failed) request
 // would otherwise reproduce the exact "stuck with no reaction" symptom
 // this whole mechanism exists to avoid.
-String renderValidatingPage() {
-    return "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+String renderValidatingPage(Lang lang) {
+    const i18n::PortalStrings& ps = i18n::portal(lang);
+    return "<!DOCTYPE html><html lang=\"" + String(i18n::langCode(lang)) +
+           "\"><head><meta charset=\"utf-8\">"
            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-           "<title>Verificando...</title><style>"
+           "<title>" + String(ps.validatingTitle) + "</title><style>"
            "body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;}"
            ".msg{padding:12px;border-radius:6px;margin-top:16px;}"
            ".err{background:#fdecea;color:#611a15;}"
@@ -459,16 +424,16 @@ String renderValidatingPage() {
            "code{display:block;font-family:monospace;word-break:break-all;background:#f4f4f4;"
            "padding:8px;border-radius:6px;margin-top:8px;}"
            "button{margin-top:12px;margin-right:8px;padding:10px 16px;font-size:16px;}"
-           "</style></head><body><h2>Verificando la configuración</h2>"
-           "<div id=\"status\" class=\"msg\">Conectando a la red wifi...</div>"
+           "</style></head><body><h2>" + String(ps.validatingHeading) + "</h2>"
+           "<div id=\"status\" class=\"msg\">" + String(ps.connectingWifiMsg) + "</div>"
            "<div id=\"fpConfirm\" style=\"display:none\">"
            "<code id=\"fpValue\"></code>"
-           "<button id=\"fpConfirmBtn\">Confirmar</button>"
-           "<button id=\"fpRejectBtn\">Rechazar</button>"
+           "<button id=\"fpConfirmBtn\">" + String(ps.confirmButton) + "</button>"
+           "<button id=\"fpRejectBtn\">" + String(ps.rejectButton) + "</button>"
            "</div>"
-           "<div id=\"slow\" class=\"hint\" style=\"display:none\">Esto está tardando más de lo "
-           "normal -- comprueba que tu móvil sigue conectado al hotspot del dispositivo.</div>"
-           "<p id=\"retryLink\" style=\"display:none\"><a href=\"/\">Volver e intentar de nuevo</a></p>"
+           "<div id=\"slow\" class=\"hint\" style=\"display:none\">" + String(ps.slowHint) + "</div>"
+           "<p id=\"retryLink\" style=\"display:none\"><a href=\"/\">" + String(ps.retryLink) +
+           "</a></p>"
            "<script>"
            "var startedAt = Date.now();"
            "var slowWarned = false;"
@@ -550,10 +515,16 @@ void handleRoot() {
         // A validation is already in flight (user navigated back to / or
         // reopened the page) -- keep them on the progress view instead of
         // a blank form that would invite a redundant resubmit.
-        server.send(200, "text/html", renderValidatingPage());
+        server.send(200, "text/html",
+                     renderValidatingPage(i18n::langFromCode(snap.candidate.language)));
         return;
     }
-    server.send(200, "text/html", renderFormPage(DeviceConfig{}, "", false));
+    // Nothing saved/attempted yet -- the language <select>'s onchange reload
+    // (?lang=...) is what lets a fresh visit switch the rendered language
+    // before anything has been submitted; defaults to English per i18n.h.
+    DeviceConfig blank;
+    blank.language = server.hasArg("lang") ? server.arg("lang") : String("en");
+    server.send(200, "text/html", renderFormPage(blank, "", false));
 }
 
 void handleSave() {
@@ -570,9 +541,13 @@ void handleSave() {
     }
     candidate.apiAuthToken = server.arg("token");
     candidate.apiAuthToken.trim();
+    candidate.language = server.arg("lang");
     // tlsFingerprint is never entered manually -- for https it's always
     // obtained and confirmed interactively during validation (TOFU, see
     // validationTask()).
+
+    const Lang lang = i18n::langFromCode(candidate.language);
+    const i18n::PortalStrings& ps = i18n::portal(lang);
 
     const bool isHttps = candidate.apiBaseUrl.startsWith("https://");
     const bool isHttp = candidate.apiBaseUrl.startsWith("http://");
@@ -580,16 +555,15 @@ void handleSave() {
     // Local format checks first -- no reason to touch the radio for a
     // typo'd URL or missing field.
     if (candidate.wifiSsid.length() == 0) {
-        server.send(200, "text/html", renderFormPage(candidate, "Falta el SSID de la wifi.", true));
+        server.send(200, "text/html", renderFormPage(candidate, ps.errMissingSsid, true));
         return;
     }
     if (!isHttps && !isHttp) {
-        server.send(200, "text/html",
-                     renderFormPage(candidate, "La URL debe empezar por http:// o https://.", true));
+        server.send(200, "text/html", renderFormPage(candidate, ps.errBadUrl, true));
         return;
     }
     if (candidate.apiAuthToken.length() == 0) {
-        server.send(200, "text/html", renderFormPage(candidate, "Falta el token.", true));
+        server.send(200, "text/html", renderFormPage(candidate, ps.errMissingToken, true));
         return;
     }
 
@@ -605,7 +579,7 @@ void handleSave() {
     // drop with no way to recover (see CLAUDE.md for how that showed up
     // on real hardware).
     tryStartValidation(candidate);
-    server.send(200, "text/html", renderValidatingPage());
+    server.send(200, "text/html", renderValidatingPage(lang));
 }
 
 void handleValidateStatus() {

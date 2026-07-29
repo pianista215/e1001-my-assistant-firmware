@@ -261,7 +261,7 @@ void sleep() {
     writeData(0xA5);
 }
 
-void drawErrorScreen(const char* code, uint8_t consecutiveFailures) {
+void drawErrorScreen(const char* code, uint8_t consecutiveFailures, Lang lang) {
     Gray4Buffer canvas(EPD_EXPECTED_WIDTH, EPD_EXPECTED_HEIGHT);
     const uint32_t bufSize = static_cast<uint32_t>(EPD_EXPECTED_WIDTH) * EPD_EXPECTED_HEIGHT / 4;
     canvas.buf = static_cast<uint8_t*>(malloc(bufSize));
@@ -274,7 +274,7 @@ void drawErrorScreen(const char* code, uint8_t consecutiveFailures) {
     canvas.print(code);
 
     char line2[40];
-    snprintf(line2, sizeof(line2), "fallos consecutivos: %u", consecutiveFailures);
+    snprintf(line2, sizeof(line2), i18n::panel(lang).errorFailuresFmt, consecutiveFailures);
     canvas.setTextSize(2);
     canvas.setCursor(60, 260);
     canvas.print(line2);
@@ -303,45 +303,50 @@ void drawProvisioningScreen(const char* apSsid, const char* apPassword, const ch
     constexpr int16_t kQrBoxSize = 320;
     drawQrCode(canvas, qrPayload, kQrBoxX, kQrBoxY, kQrBoxSize);
 
+    // Always rendered before any config exists (fresh device, or right
+    // after the reset gesture clears it), so it always uses the fixed
+    // default language -- see i18n.h.
+    const i18n::PanelStrings& ps = i18n::panel(Lang::EN);
+
     const int16_t textX = kQrBoxX + kQrBoxSize + 40;
     int16_t y = 70;
     canvas.setTextColor(0);  // black
 
     canvas.setTextSize(3);
     canvas.setCursor(textX, y);
-    canvas.print("Configura el");
+    canvas.print(ps.provisioningTitleLine1);
     y += 36;
     canvas.setCursor(textX, y);
-    canvas.print("dispositivo");
+    canvas.print(ps.provisioningTitleLine2);
     y += 60;
 
     canvas.setTextSize(2);
     canvas.setCursor(textX, y);
-    canvas.print("1. Escanea el QR para");
+    canvas.print(ps.provisioningStep1Line1);
     y += 26;
     canvas.setCursor(textX, y);
-    canvas.print("unirte a esta red WiFi.");
+    canvas.print(ps.provisioningStep1Line2);
     y += 50;
 
     canvas.setCursor(textX, y);
-    canvas.print("Si no conecta solo:");
+    canvas.print(ps.provisioningFallbackIntro);
     y += 32;
     canvas.setCursor(textX, y);
-    canvas.print("Red:");
+    canvas.print(ps.provisioningNetworkLabel);
     canvas.setCursor(textX + 90, y);
     canvas.print(apSsid);
     y += 30;
     canvas.setCursor(textX, y);
-    canvas.print("Clave:");
+    canvas.print(ps.provisioningPasswordLabel);
     canvas.setCursor(textX + 90, y);
     canvas.print(apPassword);
     y += 50;
 
     canvas.setCursor(textX, y);
-    canvas.print("2. Si no se abre solo,");
+    canvas.print(ps.provisioningStep2Line1);
     y += 26;
     canvas.setCursor(textX, y);
-    canvas.print("visita:");
+    canvas.print(ps.provisioningStep2Line2);
     y += 30;
     canvas.setCursor(textX, y);
     canvas.print(fallbackUrl);
