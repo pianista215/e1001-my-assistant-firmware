@@ -99,22 +99,35 @@ with its own coin-cell battery, independent of the ESP32's internal RTC
 (which only survives *deep sleep*, not a full reset/EN or a total loss of
 power).
 
-Approach (`main.cpp` + `rtc_pcf8563.cpp`):
+Approach (`main.cpp` + `rtc_pcf8563.cpp` + `time_sync.cpp`):
 1. On boot: read the PCF8563 → `settimeofday()` immediately (fast, no
    network needed). If the VL (voltage-low) flag is set, the time isn't
    trustworthy and is ignored.
-2. After connecting WiFi: try SNTP (`configTzTime` + `getLocalTime`,
-   timeout `SNTP_SYNC_TIMEOUT_MS`). If it works, it's authoritative — it
-   gets written back to the PCF8563 so drift doesn't accumulate cycle over
-   cycle.
-3. If SNTP fails but the PCF8563 gave a valid time this cycle, or if a sync
-   has already happened at least once since the last power-on (the ESP32's
-   own system clock keeps ticking on its own between deep-sleep cycles),
-   `time(nullptr)` is used.
-4. If there's never been a trustworthy time (true first boot, RTC coin
-   cell just installed): don't try to compute an hourly schedule off an
-   unknown clock — sleep a short fixed interval (`FIRST_BOOT_RETRY_SLEEP_SEC`)
-   until an SNTP sync succeeds.
+2. Right after WiFi connects: `timesync::begin()` starts SNTP
+   (`configTzTime`) and **returns immediately** — the NTP round trip
+   overlaps the HTTP fetch and the panel refresh, so a real sync costs the
+   cycle no extra awake time.
+3. Just before sleeping (`finishTimeSync()`, on both the success and the
+   failure path, since a cycle that reached the network still has a good
+   clock to hand to the RTC): collect that sync with
+   `timesync::waitSynced(SNTP_SYNC_TIMEOUT_MS)` — a budget counted *from
+   `begin()`*, so by then it's normally already spent on useful work. On
+   success SNTP is authoritative: `rtc::writeNow()` pushes it back into
+   the PCF8563 (rounded to the nearest second, not truncated) and the
+   RTC-vs-SNTP drift is logged.
+4. If SNTP didn't land but the PCF8563 gave a valid time this cycle, or a
+   sync has already happened at least once since the last power-on (the
+   ESP32's own system clock keeps ticking on its own between deep-sleep
+   cycles), `time(nullptr)` is used as-is.
+5. If there's never been a trustworthy time (true first boot, RTC coin
+   cell just installed): this is the one case that blocks on SNTP before
+   the fetch, because without a clock there's no schedule to compute. If
+   it still fails, sleep a short fixed interval
+   (`FIRST_BOOT_RETRY_SLEEP_SEC`) and retry.
+
+The wake schedule is computed from a `time(nullptr)` read **immediately
+before `goToSleep()`**, not from one captured earlier in the cycle — see
+the real finding below.
 
 **Why not just SNTP**: the PCF8563 gives a reasonable time even without a
 network (or before WiFi connects), and it survives a total loss of power,
@@ -136,6 +149,47 @@ penalize the normal case (a successful sync doesn't take longer just
 because it has more budget available) and avoids spending an entire retry
 cycle (with its own WiFi reconnect) on a sync that only needed a few more
 seconds.
+
+**Real finding on the device (`getLocalTime()` is not a sync check — the
+hourly refresh drifted minutes late)**: after days of uptime the refresh
+slipped monotonically past the hour — first :01, then :02, eventually
+:05-:06 — while the backend host's clock stayed correct. Two independent
+bugs, both in the same handful of lines:
+
+- *The accumulating part.* SNTP had effectively never resynced since the
+  very first boot. `main.cpp` used `getLocalTime(&now, SNTP_SYNC_TIMEOUT_MS)`
+  as its "did SNTP sync?" criterion, but that core function (see
+  `cores/esp32/esp32-hal-time.c`) only loops until `tm_year > (2016-1900)`
+  — it never inspects the SNTP client's state. Since step 1 had already
+  seeded the system clock from the PCF8563 with a plausible year, it
+  returned `true` on its first iteration, before any NTP packet existed.
+  The firmware then logged "SNTP sync OK, correcting RTC" and wrote the
+  PCF8563's own time straight back into the PCF8563: a no-op. The genuine
+  NTP answer did arrive a moment later and did fix the system clock, but
+  `now` was already captured, and the next boot's
+  `syncSystemClockFromRtc()` overwrote the correction anyway. Net effect:
+  the device ran forever on a free-running PCF8563 that nothing ever
+  corrected, and its drift accumulated cycle over cycle. It also explains
+  why the *first* day was perfect: on that boot the coin cell was fresh,
+  the VL flag was set, the system clock was still at 1970, so
+  `getLocalTime()` genuinely waited for NTP — the only real sync in the
+  device's life. Fixed with `time_sync.{h,cpp}`, which registers the SNTP
+  client's own `sntp_set_time_sync_notification_cb()` before starting it:
+  the flag is set only by a received packet actually setting the clock.
+- *The constant part (the baseline ~:01).* `computeNextWake(now)` was fed
+  the `now` captured before the HTTP fetch and the full-panel refresh,
+  which together take tens of seconds. The sleep duration was therefore
+  measured from one instant but started from a much later one, so every
+  wake landed past the hour by however long the cycle's work took. Fixed
+  by reading the clock immediately before `goToSleep()`.
+
+Diagnostics added at the same time so this can't hide again: `[TIME] SNTP
+synced in N ms`, `[TIME] RTC drift vs SNTP: ±N s` (negative = the RTC is
+running behind) and `[TIME] Now HH:MM:SS -> next wake HH:MM:SS` on every
+cycle. Deliberately *not* added: waking a few seconds *before* the hour to
+absorb the WiFi association time — the backend renders the content of the
+hour in progress, so a request at :59:5X would fetch the previous hour's
+image.
 
 ## Design decision: physical manual-refresh button
 
@@ -414,6 +468,7 @@ gesture — it's KEY0-held only.
 | `display_client.{h,cpp}` | HTTP(S) client + fingerprint pinning + strict EINK format validation; reused as-is by the portal's live validation |
 | `eink_driver.{h,cpp}` | Raw UC8179 driver (init, LUTs, bit-plane upload, refresh, sleep, error screen, provisioning screen with QR) |
 | `i18n.{h,cpp}` | English/Spanish string tables for the e-ink panel and the setup portal's web UI, selected by the device's saved language (see "Per-device config" above) |
+| `time_sync.{h,cpp}` | Real SNTP sync detection (notification callback, not `getLocalTime()`), started early and collected late so the round trip overlaps the cycle's work |
 | `time_scheduler.{h,cpp}` | Pure logic for computing the next wake time |
 
 ## Design decision: battery is read before touching WiFi
@@ -524,6 +579,11 @@ the device):
   fingerprint (not just that it accepts a correct one, already confirmed
   on real hardware after the `domain_name` fix described above) without
   hanging in the TLS handshake.
+- That the SNTP fix actually holds the schedule: the first cycle after
+  flashing should log a large one-off `[TIME] RTC drift vs SNTP` (the
+  minutes accumulated while nothing was correcting the PCF8563) and every
+  cycle after that a drift of a few seconds at most, with the backend's
+  request log staying at :00:0X over several days instead of creeping.
 - That `ESP.restart()` (used both when saving config and when applying the
   reset gesture) preserves `RTC_DATA_ATTR g_state` on this specific unit —
   documented as such in ESP-IDF (only a real power-on/EN resets it), not

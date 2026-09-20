@@ -19,10 +19,18 @@ bool begin();
 // trusted -- or if the I2C read itself failed.
 bool syncSystemClockFromRtc();
 
-// Writes `t` to the RTC. Used after a successful SNTP sync so the RTC
-// doesn't drift across cycles that never reach the network. `t` is
-// expected to already represent local time in the firmware's configured
-// timezone (as produced by localtime_r()/getLocalTime()).
+// Writes `t` to the RTC. `t` is expected to already represent local time
+// in the firmware's configured timezone (as produced by localtime_r()).
+// The raw primitive behind writeNow(), which is what the normal cycle
+// uses after a confirmed SNTP sync.
 bool writeTime(const struct tm& t);
+
+// Writes the *current* system time to the RTC, rounded to the nearest
+// second. writeTime() takes a struct tm, whose seconds are already
+// truncated, so every write silently lost the sub-second remainder --
+// always in the same direction (the RTC ends up behind). Rounding makes
+// that error zero-mean instead of cumulative, which matters on cycles
+// where the RTC is the only time source available.
+bool writeNow();
 
 }  // namespace rtc
