@@ -11,7 +11,7 @@ struct WakeDecision {
 };
 
 // Computes when to wake up next, given the current local time `nowLocal`
-// (as produced by localtime_r()/getLocalTime(), tm_isdst set appropriately
+// (as produced by localtime_r(), tm_isdst set appropriately
 // by the caller -- this function re-derives it via mktime()).
 //
 // Always lands on the top of an hour. If that hour would fall in

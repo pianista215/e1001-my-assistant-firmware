@@ -62,6 +62,13 @@ constexpr unsigned long HTTP_TIMEOUT_MS = 8000;
 constexpr size_t HTTP_MAX_RESPONSE_BYTES = 200000;  // defensive cap before allocating
 
 // ---- SNTP ----
+// Budget for a *real* sync (an NTP packet actually setting the clock --
+// see time_sync.h), counted from timesync::begin() rather than from the
+// moment it's awaited. Since begin() fires right after WiFi comes up and
+// the wait happens after the fetch and the panel refresh, the normal
+// cycle has usually already spent this budget doing useful work and the
+// wait costs nothing.
+//
 // 3000ms was too tight in practice: confirmed on real hardware with a
 // genuinely internet-connected network -- the first sync of a boot can
 // take longer than that (DNS resolution + round trip), which was causing

@@ -17,6 +17,7 @@
 #include "sleep_control.h"
 #include "sleep_state.h"
 #include "time_scheduler.h"
+#include "time_sync.h"
 #include "wifi_manager.h"
 
 // Survives deep sleep (reset only on a true power-on/EN reset -- see
@@ -50,6 +51,46 @@ bool buttonHeldFor(unsigned long holdMs) {
     return true;
 }
 
+// Snapshot of what the PCF8563 said at boot, kept for the drift log below.
+bool g_rtcOk = false;
+bool g_rtcTimeOk = false;
+time_t g_rtcEpochAtBoot = 0;
+unsigned long g_rtcReadMs = 0;
+
+// Collects the SNTP round trip started right after WiFi came up (see
+// setup()) and pushes the corrected time back into the PCF8563. Runs at
+// the end of the cycle -- success or failure -- because a cycle that
+// reached the network still has a good clock to hand to the RTC even if
+// the endpoint itself failed. Idempotent: only the first call does work.
+void finishTimeSync() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    // Normally already synced: the NTP answer landed while the image was
+    // being fetched and painted, so this spends no extra awake time. If
+    // timesync::begin() was never reached (WiFi failed), the budget is
+    // long expired and this returns immediately.
+    if (!timesync::waitSynced(SNTP_SYNC_TIMEOUT_MS)) {
+        Serial1.println("[TIME] SNTP not synced this cycle; using RTC/system time.");
+        if (g_rtcTimeOk) g_state.timeEverSynced = true;
+        return;
+    }
+
+    Serial1.printf("[TIME] SNTP synced in %lu ms.\n", timesync::syncElapsedMs());
+    if (g_rtcTimeOk) {
+        // What the RTC would be reading right now, minus the real time:
+        // negative means the RTC is running behind (wake lands late).
+        const time_t rtcNow = g_rtcEpochAtBoot + static_cast<time_t>((millis() - g_rtcReadMs) / 1000);
+        Serial1.printf("[TIME] RTC drift vs SNTP: %+ld s\n",
+                        static_cast<long>(rtcNow - time(nullptr)));
+    }
+    g_state.timeEverSynced = true;
+    if (g_rtcOk && !rtc::writeNow()) {
+        Serial1.println("[TIME] Failed to write the corrected time to the RTC.");
+    }
+}
+
 uint32_t backoffSeconds(uint8_t failures) {
     const uint8_t shift = failures > 4 ? 4 : failures;  // cap to avoid overflow
     uint32_t seconds = BACKOFF_BASE_SEC << shift;
@@ -62,6 +103,7 @@ uint32_t backoffSeconds(uint8_t failures) {
 // after several consecutive failures, so a transient blip doesn't cost an
 // e-paper refresh.
 [[noreturn]] void handleFailure(const char* code, Lang lang) {
+    finishTimeSync();
     if (g_state.consecutiveFailures < 255) g_state.consecutiveFailures++;
     Serial1.printf("[MAIN] Failure: %s (consecutive=%u)\n", code, g_state.consecutiveFailures);
 
@@ -118,6 +160,10 @@ void setup() {
 
     const bool rtcOk = rtc::begin();
     const bool rtcTimeOk = rtcOk && rtc::syncSystemClockFromRtc();
+    g_rtcOk = rtcOk;
+    g_rtcTimeOk = rtcTimeOk;
+    g_rtcEpochAtBoot = rtcTimeOk ? time(nullptr) : 0;
+    g_rtcReadMs = millis();
     if (!rtcOk) {
         Serial1.println("[MAIN] PCF8563 not responding on I2C.");
     } else if (!rtcTimeOk) {
@@ -141,34 +187,23 @@ void setup() {
     }
     Serial1.println("[MAIN] WiFi connected.");
 
-    configTzTime(TZ_STRING, SNTP_SERVER_1, SNTP_SERVER_2);
-    struct tm now = {};
-    const bool sntpOk = getLocalTime(&now, SNTP_SYNC_TIMEOUT_MS);
+    // Start the NTP round trip and deliberately DON'T wait for it here:
+    // it runs in the background while the image is fetched and painted,
+    // so a real sync costs the cycle no extra awake time. It's collected
+    // in finishTimeSync() just before sleeping.
+    timesync::begin();
 
-    if (sntpOk) {
-        Serial1.println("[MAIN] SNTP sync OK, correcting RTC.");
-        rtc::writeTime(now);
-        g_state.timeEverSynced = true;
-    } else if (rtcTimeOk) {
-        Serial1.println("[MAIN] SNTP failed, using RTC-derived time.");
-        const time_t nowEpoch = time(nullptr);
-        localtime_r(&nowEpoch, &now);
-        g_state.timeEverSynced = true;
-    } else if (g_state.timeEverSynced) {
-        // Neither RTC nor SNTP worked this cycle, but the ESP32's own system
-        // clock has kept ticking since a previous successful sync (it
-        // survives deep-sleep-only cycles on its own).
-        Serial1.println("[MAIN] SNTP and RTC both unavailable, trusting system clock.");
-        const time_t nowEpoch = time(nullptr);
-        localtime_r(&nowEpoch, &now);
-    } else {
+    if (!rtcTimeOk && !g_state.timeEverSynced) {
         // No trustworthy time source anywhere yet (very first boot, RTC
-        // coin cell just installed). Don't guess an hourly schedule off of
-        // an unknown clock -- just retry soon.
-        Serial1.println("[MAIN] No trustworthy time source yet; short retry sleep.");
-        wifiDisconnect();
-        goToSleep(FIRST_BOOT_RETRY_SLEEP_SEC);
-        return;
+        // coin cell just installed). This is the one case where we have to
+        // block on SNTP: without a clock there's no hourly schedule to
+        // compute, not even a sensible retry.
+        if (!timesync::waitSynced(SNTP_SYNC_TIMEOUT_MS)) {
+            Serial1.println("[TIME] No trustworthy time source yet; short retry sleep.");
+            wifiDisconnect();
+            goToSleep(FIRST_BOOT_RETRY_SLEEP_SEC);
+            return;
+        }
     }
 
     const DisplayEndpointConfig endpoint{cfg.apiBaseUrl, cfg.apiAuthToken, cfg.tlsFingerprint};
@@ -197,6 +232,7 @@ void setup() {
 
     Serial1.println("[MAIN] Cycle OK.");
     g_state.consecutiveFailures = 0;
+    finishTimeSync();
     wifiDisconnect();
 
 #ifdef DEBUG_SLEEP_OVERRIDE_SEC
@@ -207,7 +243,19 @@ void setup() {
     Serial1.println("[MAIN] DEBUG_SLEEP_OVERRIDE_SEC active -- not sleeping a full hour.");
     goToSleep(DEBUG_SLEEP_OVERRIDE_SEC);
 #else
+    // Read the clock HERE, not before the fetch: the HTTP request and the
+    // full-panel refresh take tens of seconds, and computing the sleep
+    // from a "now" captured before them made every wake land that much
+    // past the hour (the sleep started long after the instant it was
+    // measured from).
+    const time_t nowEpoch = time(nullptr);
+    struct tm now = {};
+    localtime_r(&nowEpoch, &now);
+
     const WakeDecision wake = computeNextWake(now);
+    Serial1.printf("[TIME] Now %02d:%02d:%02d -> next wake %02d:%02d:%02d\n", now.tm_hour,
+                    now.tm_min, now.tm_sec, wake.target.tm_hour, wake.target.tm_min,
+                    wake.target.tm_sec);
     goToSleep(static_cast<uint32_t>(wake.sleepSeconds));
 #endif
 }

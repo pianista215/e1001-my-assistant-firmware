@@ -97,4 +97,16 @@ bool writeTime(const struct tm& tIn) {
     return Wire.endTransmission() == 0;
 }
 
+bool writeNow() {
+    struct timeval tv = {};
+    if (gettimeofday(&tv, nullptr) != 0) return false;
+
+    time_t epoch = tv.tv_sec;
+    if (tv.tv_usec >= 500000) epoch++;  // round, don't truncate (see header)
+
+    struct tm t = {};
+    localtime_r(&epoch, &t);
+    return writeTime(t);
+}
+
 }  // namespace rtc
